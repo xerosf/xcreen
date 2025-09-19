@@ -28,17 +28,6 @@ jobs:
           toolchain: stable
           targets: x86_64-pc-windows-msvc
 
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: x86_64-pc-windows-msvc
-
-      - name: Show rustup and rustc versions
-        shell: pwsh
-        run: |
-          rustup show
-          rustc -Vv
-
       - name: Build (release, x86_64-pc-windows-msvc)
         shell: pwsh
         run: |
