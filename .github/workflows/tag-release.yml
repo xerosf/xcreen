@@ -4,15 +4,24 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and release (e.g., v0.1.0)'
+        required: true
 
 jobs:
   build-and-release:
     runs-on: windows-latest
     permissions:
       contents: write
+    env:
+      REL_TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_type == 'tag' && github.ref || format('refs/tags/{0}', inputs.tag) }}
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -28,13 +37,15 @@ jobs:
           Copy-Item README.md dist/
           Copy-Item LICENSE dist/
           if (Test-Path 'src/icons/icon.ico') { Copy-Item src/icons/icon.ico dist/ }
-          Compress-Archive -Path dist/* -DestinationPath xcreen-${{ github.ref_name }}-windows-amd64.zip -Force
+          Compress-Archive -Path dist/* -DestinationPath xcreen-${{ env.REL_TAG }}-windows-amd64.zip -Force
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: xcreen-${{ github.ref_name }}-windows-amd64.zip
+          files: xcreen-${{ env.REL_TAG }}-windows-amd64.zip
           draft: false
           prerelease: false
+          tag_name: ${{ env.REL_TAG }}
+          name: XCreen ${{ env.REL_TAG }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
