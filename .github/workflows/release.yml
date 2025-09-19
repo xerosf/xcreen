@@ -24,7 +24,7 @@ jobs:
         with:
           name: xcreen-windows-amd64
           path: |
-            target/release/xcreen.exe
+            target/x86_64-pc-windows-msvc/release/xcreen.exe
             README.md
             LICENSE
             src/icons/icon.ico

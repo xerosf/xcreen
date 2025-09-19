@@ -1,0 +1,40 @@
+name: release-on-tag
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Package artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/xcreen.exe dist/
+          Copy-Item README.md dist/
+          Copy-Item LICENSE dist/
+          if (Test-Path 'src/icons/icon.ico') { Copy-Item src/icons/icon.ico dist/ }
+          Compress-Archive -Path dist/* -DestinationPath xcreen-${{ github.ref_name }}-windows-amd64.zip -Force
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: xcreen-${{ github.ref_name }}-windows-amd64.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
