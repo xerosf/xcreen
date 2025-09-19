@@ -1,0 +1,62 @@
+[package]
+name = "xcreen"
+version = "1.0.0"
+description = "External Monitor Brightness Control"
+authors = ["Sansith Fernando"]
+edition = "2021"
+readme = "README.md"
+repository = "https://github.com/xerosf/xcreen"
+license-file = "LICENSE"
+build = "build.rs"
+
+# Performance optimizations
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 1
+
+# Pure Rust binary - no library needed
+[[bin]]
+name = "xcreen"
+path = "src/main.rs"
+
+[dependencies]
+# Native system tray and UI
+tray-icon = "0.21"
+winit = "0.29"
+image = "0.24"
+
+# Core functionality
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+
+# Logging
+log = "0.4"
+env_logger = "0.10"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Windows-specific APIs for monitor control and sensor access
+windows = { version = "0.56.0", features = [
+    "Devices_Sensors",
+    "Foundation", 
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader"
+] }
+
+# Native dialogs (optional)
+native-dialog = "0.6"
+
+# Autostart functionality (Windows registry manipulation)
+winreg = "0.51"
+
+# File system watching for config changes
+notify = "6.1"
+
+[build-dependencies]
+winres = "0.1"

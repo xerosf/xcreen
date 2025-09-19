@@ -1,0 +1,26 @@
+# Rust
+target/
+Cargo.lock
+**/*.rs.bk
+
+# IDE
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Windows build artifacts
+*.pdb
+*.exe
+*.dll
+*.lib
+*.obj
+*.ilk
+*.exp
+
+# Config files
+config.json
+
+# Logs
+*.log
