@@ -106,12 +106,6 @@ pub struct MonitorInfo {
     pub cached_contrast: Option<u32>,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct MonitorSettings {
-    pub brightness: u32,
-    pub contrast: u32,
-}
-
 pub fn get_monitor_list_sync() -> Result<Vec<MonitorInfo>, String> {
     let mut monitors = Vec::new();
     
@@ -166,8 +160,8 @@ pub fn set_monitor_settings_with_cache(monitor_info: &mut MonitorInfo, brightnes
     }
     
     // Check if we actually need to write to hardware
-    let brightness_changed = monitor_info.cached_brightness.map_or(true, |cached| cached != brightness);
-    let contrast_changed = monitor_info.cached_contrast.map_or(true, |cached| cached != contrast);
+    let brightness_changed = monitor_info.cached_brightness != Some(brightness);
+    let contrast_changed = monitor_info.cached_contrast != Some(contrast);
     
     if !brightness_changed && !contrast_changed {
         // No hardware write needed - values are already set!
@@ -192,19 +186,6 @@ pub fn set_monitor_settings_with_cache(monitor_info: &mut MonitorInfo, brightnes
             }
             Ok(apply.brightness_wrote || apply.contrast_wrote)
         }
-        Err(e) => Err(e),
-    }
-}
-
-#[allow(dead_code)]
-pub fn set_monitor_settings_sync(monitor_handle: isize, brightness: u32, contrast: u32) -> Result<(), String> {
-    if brightness > 100 || contrast > 100 {
-        return Err("Values must be between 0 and 100".to_string());
-    }
-
-    // No knowledge of cache in this function; assume both may need updating
-    match set_monitor_settings_sync_internal(monitor_handle, brightness, contrast, true, true) {
-        Ok(_) => Ok(()),
         Err(e) => Err(e),
     }
 }

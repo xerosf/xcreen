@@ -20,42 +20,36 @@ strip = true
 [profile.dev]
 opt-level = 1
 
-# Pure Rust binary - no library needed
 [[bin]]
 name = "xcreen"
 path = "src/main.rs"
 
 [dependencies]
-# Native system tray and UI
+# System tray
 tray-icon = "0.21"
 winit = "0.29"
-image = "0.24"
+image = { version = "0.24", default-features = false, features = ["png"] }
 
-# Core functionality
+# Config persistence
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["full"] }
 
 # Logging
-log = "0.4"
-env_logger = "0.10"
-chrono = { version = "0.4", features = ["serde"] }
+log = { version = "0.4", features = ["std"] }
 
-# Windows-specific APIs for monitor control and sensor access
+# Windows APIs for DDC/CI and light sensor
 windows = { version = "0.56.0", features = [
     "Devices_Sensors",
     "Foundation", 
     "Win32_Graphics_Gdi",
-    "Win32_System_LibraryLoader"
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging"
 ] }
 
-# Native dialogs (optional)
-native-dialog = "0.6"
-
-# Autostart functionality (Windows registry manipulation)
+# Autostart (Windows registry)
 winreg = "0.51"
 
-# File system watching for config changes
+# Config file watching
 notify = "6.1"
 
 [build-dependencies]

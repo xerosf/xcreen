@@ -1,16 +1,14 @@
-use windows::{
-    Devices::Sensors::LightSensor,
-};
+use windows::Devices::Sensors::LightSensor;
 
-pub fn get_light_sensor_lux_sync() -> Result<f64, String> {
+/// Read the ambient light sensor value in lux
+pub fn get_light_sensor_lux() -> Result<f64, String> {
     let sensor = LightSensor::GetDefault()
-        .map_err(|e| format!("Failed to get light sensor: {}", e))?;
+        .map_err(|e| format!("No light sensor available: {}", e))?;
     
     let reading = sensor.GetCurrentReading()
-        .map_err(|e| format!("Failed to get sensor reading: {}", e))?;
+        .map_err(|e| format!("Failed to read sensor: {}", e))?;
 
-    let lux = reading.IlluminanceInLux()
-        .map_err(|e| format!("Failed to get illuminance value: {}", e))?;
-
-    Ok(lux as f64)
+    reading.IlluminanceInLux()
+        .map(|lux| lux as f64)
+        .map_err(|e| format!("Failed to get lux value: {}", e))
 }
