@@ -1,6 +1,6 @@
 [package]
 name = "xcreen"
-version = "0.2.0"
+version = "0.3.0"
 description = "External Monitor Brightness Control"
 authors = ["Sansith Fernando"]
 edition = "2024"

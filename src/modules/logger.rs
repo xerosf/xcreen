@@ -1,6 +1,6 @@
 use log::{LevelFilter, Metadata, Record};
 use std::fs::{File, OpenOptions};
-use std::io::{Write, BufWriter};
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -21,7 +21,7 @@ impl FileLogger {
         };
 
         let log_path = Self::get_log_path()?;
-        
+
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -36,12 +36,13 @@ impl FileLogger {
     }
 
     fn get_log_path() -> Result<PathBuf, String> {
-        let exe_path = std::env::current_exe()
-            .map_err(|e| format!("Failed to get executable path: {}", e))?;
-        
-        let exe_dir = exe_path.parent()
+        let exe_path =
+            std::env::current_exe().map_err(|e| format!("Failed to get executable path: {}", e))?;
+
+        let exe_dir = exe_path
+            .parent()
             .ok_or("Failed to get executable directory")?;
-        
+
         Ok(exe_dir.join("xcreen.log"))
     }
 }
@@ -88,9 +89,8 @@ pub fn init_logger(log_level: &str) -> Result<(), String> {
         "debug" => LevelFilter::Debug,
         _ => LevelFilter::Warn,
     };
-    
-    log::set_boxed_logger(Box::new(logger))
-        .map_err(|e| format!("Failed to set logger: {}", e))?;
+
+    log::set_boxed_logger(Box::new(logger)).map_err(|e| format!("Failed to set logger: {}", e))?;
     log::set_max_level(level);
 
     log::info!("XCreen logger initialized (level: {})", log_level);
