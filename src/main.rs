@@ -1103,7 +1103,6 @@ fn init_dark_mode() {
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     init_dark_mode();
-    windows_reactor::bootstrap()?;
     let config = AppConfig::load().unwrap_or_else(|err| {
         eprintln!("Config load error, using defaults: {err}");
         AppConfig::default()
