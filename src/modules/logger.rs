@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 pub struct FileLogger {
     writer: Mutex<BufWriter<File>>,
-    level: LevelFilter,
+    _level: LevelFilter,
     console_enabled: bool,
 }
 
@@ -30,7 +30,7 @@ impl FileLogger {
 
         Ok(FileLogger {
             writer: Mutex::new(BufWriter::new(file)),
-            level,
+            _level: level,
             console_enabled: cfg!(debug_assertions),
         })
     }
@@ -43,13 +43,13 @@ impl FileLogger {
             .parent()
             .ok_or("Failed to get executable directory")?;
 
-        Ok(exe_dir.join("xcreen.log"))
+        Ok(exe_dir.join("XCreen.log"))
     }
 }
 
 impl log::Log for FileLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= self.level
+        metadata.level() <= log::max_level()
     }
 
     fn log(&self, record: &Record) {
@@ -93,6 +93,6 @@ pub fn init_logger(log_level: &str) -> Result<(), String> {
     log::set_boxed_logger(Box::new(logger)).map_err(|e| format!("Failed to set logger: {}", e))?;
     log::set_max_level(level);
 
-    log::info!("xcreen logger initialized (level: {})", log_level);
+    log::info!("XCreen logger initialized (level: {})", log_level);
     Ok(())
 }

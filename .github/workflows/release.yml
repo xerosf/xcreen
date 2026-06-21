@@ -46,45 +46,29 @@ jobs:
           "version=$version" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append -Encoding utf8
           "tag=v$version" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append -Encoding utf8
 
-      - name: Prepare release bundle (zip)
-        id: bundle
+      - name: Install Inno Setup
         shell: pwsh
         run: |
-          $ReleaseDir = "target/x86_64-pc-windows-msvc/release"
-          $ExePath = Join-Path $ReleaseDir "xcreen.exe"
-          if (!(Test-Path $ExePath)) { Write-Error "Binary not found: $ExePath" }
-          $ZipName = "xcreen-${{ steps.version.outputs.version }}-windows-x86_64.zip"
-          $BundleDir = "xcreen-${{ steps.version.outputs.version }}-windows-x86_64"
-          if (Test-Path $BundleDir) { Remove-Item $BundleDir -Recurse -Force }
-          New-Item -ItemType Directory -Path $BundleDir | Out-Null
+          choco install innosetup -y
 
-          # windows-reactor-setup stages the self-contained runtime beside the binary.
-          Get-ChildItem $ReleaseDir -File | Where-Object {
-            $_.Name -eq "xcreen.exe" -or $_.Extension -in ".dll", ".pri", ".xaml"
-          } | Copy-Item -Destination $BundleDir
-          Get-ChildItem $ReleaseDir -Directory | Where-Object {
-            $_.Name -notin "build", "deps", "examples", "incremental"
-          } | Copy-Item -Destination $BundleDir -Recurse
-          Copy-Item LICENSE, README.md -Destination $BundleDir
-
-          if (Test-Path $ZipName) { Remove-Item $ZipName -Force }
-          Compress-Archive -Path $BundleDir -DestinationPath $ZipName -Force
-          "zip=$ZipName" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append -Encoding utf8
+      - name: Build Installer
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DMyAppVersion="${{ steps.version.outputs.version }}" installer.iss
 
       - name: Upload artifact (CI)
         uses: actions/upload-artifact@v4
         with:
-          name: xcreen-windows-${{ steps.version.outputs.version }}
-          path: ${{ steps.bundle.outputs.zip }}
+          name: XCreen-Setup-${{ steps.version.outputs.version }}
+          path: XCreen-Setup-${{ steps.version.outputs.version }}.exe
           if-no-files-found: error
 
       - name: Create GitHub Release
         uses: ncipollo/release-action@v1.14.0
         with:
           tag: ${{ steps.version.outputs.tag }}
-          name: xcreen ${{ steps.version.outputs.tag }}
-          artifacts: ${{ steps.bundle.outputs.zip }}
-          artifactContentType: application/zip
+          name: XCreen ${{ steps.version.outputs.tag }}
+          artifacts: XCreen-Setup-${{ steps.version.outputs.version }}.exe
           generateReleaseNotes: true
           allowUpdates: true
           replacesArtifacts: true

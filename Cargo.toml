@@ -1,12 +1,12 @@
 [package]
-name = "xcreen"
+name = "XCreen"
 version = "0.4.0"
 description = "External Monitor Brightness Control"
 authors = ["Sansith Fernando"]
 edition = "2024"
 rust-version = "1.95"
 readme = "README.md"
-repository = "https://github.com/xerosf/xcreen"
+repository = "https://github.com/xerosf/XCreen"
 license-file = "LICENSE"
 build = "build.rs"
 
@@ -22,7 +22,7 @@ strip = true
 opt-level = 1
 
 [[bin]]
-name = "xcreen"
+name = "XCreen"
 path = "src/main.rs"
 
 [dependencies]

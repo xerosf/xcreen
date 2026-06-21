@@ -1,9 +1,9 @@
-# xcreen
+# XCreen
 
 **Pure Rust External Monitor Brightness Control**
 
 <p align="center">
-  <img src="src/icons/icon.png" alt="xcreen Logo" width="150" height="150" />
+  <img src="src/icons/icon.png" alt="XCreen Logo" width="150" height="150" />
 </p>
 
 <p align="center">
@@ -26,9 +26,9 @@ A lightweight, native Windows application for automatic brightness control of ex
 
 ### From Release
 
-1. Download the latest xcreen release archive from the [Releases](https://github.com/xerosf/xcreen/releases) page
-2. Extract the complete archive to your desired location; xcreen's self-contained WinUI runtime files must remain beside `xcreen.exe`
-3. Run `xcreen.exe`
+1. Download the latest XCreen release archive from the [Releases](https://github.com/xerosf/XCreen/releases) page
+2. Extract the complete archive to your desired location; XCreen's self-contained WinUI runtime files must remain beside `XCreen.exe`
+3. Run `XCreen.exe`
 4. Left-click the system tray icon to open the monitor controls, or right-click it for Open, Refresh, and Exit
 
 ## Configuration

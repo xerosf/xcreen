@@ -3,10 +3,10 @@
   <assemblyIdentity
     version="1.0.0.0"
     processorArchitecture="*"
-    name="xcreen"
+    name="XCreen"
     type="win32"/>
   
-  <description>xcreen - Adaptive Brightness Control</description>
+  <description>XCreen - Adaptive Brightness Control</description>
   
   <!-- Windows 10/11 compatibility for dark mode context menus -->
   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">

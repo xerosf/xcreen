@@ -1,7 +1,7 @@
 fn main() {
     // Only run on Windows
     if cfg!(target_os = "windows") {
-        windows_reactor_setup::as_framework_dependent();
+        windows_reactor_setup::as_self_contained();
 
         let mut res = winres::WindowsResource::new();
 
@@ -16,10 +16,13 @@ fn main() {
             );
         }
 
-        // Embed application manifest for Windows 10/11 dark mode support
-        let manifest_path = std::path::Path::new("src/xcreen.exe.manifest");
+        // Pass application manifest to the linker so it merges with the WinUI 3 manifest from windows-reactor-setup
+        let manifest_path = std::path::Path::new("src/XCreen.exe.manifest");
         if manifest_path.exists() {
-            res.set_manifest_file(manifest_path.to_str().unwrap());
+            println!(
+                "cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}",
+                manifest_path.display()
+            );
         } else {
             println!(
                 "cargo:warning=Manifest not found at {} - dark mode may not work",
@@ -28,8 +31,8 @@ fn main() {
         }
 
         // Set some basic metadata
-        res.set("FileDescription", "xcreen - Adaptive Brightness Control");
-        res.set("ProductName", "xcreen");
+        res.set("FileDescription", "XCreen - Adaptive Brightness Control");
+        res.set("ProductName", "XCreen");
         res.set("CompanyName", "Sansith Fernando");
         res.set("LegalCopyright", "Copyright © 2025 Sansith Fernando");
 

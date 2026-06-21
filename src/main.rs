@@ -21,14 +21,14 @@ use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
 };
 use windows::Win32::System::Threading::GetCurrentThreadId;
-use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE, VK_LBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumThreadWindows, GWL_EXSTYLE, GWL_STYLE, GetForegroundWindow, GetWindowLongW,
-    IsWindowVisible, SW_HIDE, SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE,
-    SetForegroundWindow, SetWindowLongW, SetWindowPos, ShowWindow, WS_CAPTION, WS_EX_APPWINDOW,
-    WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME, HWND_TOPMOST,
-    GetWindowThreadProcessId, PostMessageW, WM_CANCELMODE, GetWindowRect, SWP_NOMOVE,
+    EnumThreadWindows, GWL_EXSTYLE, GWL_STYLE, GetForegroundWindow, GetWindowLongW, GetWindowRect,
+    GetWindowThreadProcessId, HWND_TOPMOST, IsWindowVisible, PostMessageW, SW_HIDE, SW_SHOW,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow, SetWindowLongW,
+    SetWindowPos, ShowWindow, WM_CANCELMODE, WS_CAPTION, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
 };
 use windows_reactor::*;
 use winreg::RegKey;
@@ -54,6 +54,12 @@ impl AppState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActiveView {
+    Main,
+    Settings,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct UiMonitor {
     id: String,
@@ -71,6 +77,9 @@ struct UiSnapshot {
     ambient_available: bool,
     error: Option<String>,
     load_generation: u64,
+    current_view: ActiveView,
+    autostart_enabled: bool,
+    log_level: String,
 }
 
 impl UiSnapshot {
@@ -84,6 +93,9 @@ impl UiSnapshot {
             ambient_available,
             error: None,
             load_generation: 0,
+            current_view: ActiveView::Main,
+            autostart_enabled: false,
+            log_level: "warn".to_string(),
         }
     }
 
@@ -133,9 +145,10 @@ fn refresh_snapshot_from_state(preserve_id: Option<&str>) {
             .selected_monitor()
             .map(|monitor| monitor.id.clone())
     });
-    
+
     let prev_selected_id = snapshot.selected_monitor().map(|m| m.id.clone());
-    let id_changed = prev_selected_id.is_none() || selected_id.is_none() || prev_selected_id != selected_id;
+    let id_changed =
+        prev_selected_id.is_none() || selected_id.is_none() || prev_selected_id != selected_id;
 
     snapshot.monitors = ui_monitors;
     snapshot.selected = selected_id
@@ -154,6 +167,10 @@ fn refresh_snapshot_from_state(preserve_id: Option<&str>) {
     snapshot.refreshing = false;
     snapshot.error = None;
     snapshot.ambient_available = *state.ambient_light_available.lock().unwrap();
+
+    let config = state.config.lock().unwrap();
+    snapshot.autostart_enabled = config.autostart_enabled;
+    snapshot.log_level = config.log_level.clone();
 }
 
 fn refresh_monitors_sync(state: &AppState) -> std::result::Result<(), String> {
@@ -356,12 +373,64 @@ fn update_local_level(kind: LevelKind, value: u32) {
     }
 }
 
+fn update_autostart(enable: bool) {
+    let state = APP_STATE.get().expect("app state is initialized");
+    let mut config = state.config.lock().unwrap().clone();
+    config.autostart_enabled = enable;
+    if let Err(err) = config.save() {
+        error!("Failed to save config: {err}");
+        let mut snapshot = shared_snapshot().lock().unwrap();
+        snapshot.error = Some(err);
+        drop(snapshot);
+        publish_snapshot();
+        return;
+    }
+    if let Err(err) = set_autostart(enable) {
+        error!("Failed to set registry autostart: {err}");
+        let mut snapshot = shared_snapshot().lock().unwrap();
+        snapshot.error = Some(err);
+        drop(snapshot);
+        publish_snapshot();
+        return;
+    }
+    *state.config.lock().unwrap() = config;
+    refresh_snapshot_from_state(None);
+    publish_snapshot();
+}
+
+fn update_log_level(level: String) {
+    let state = APP_STATE.get().expect("app state is initialized");
+    let mut config = state.config.lock().unwrap().clone();
+    config.log_level = level.clone();
+    if let Err(err) = config.save() {
+        error!("Failed to save config: {err}");
+        let mut snapshot = shared_snapshot().lock().unwrap();
+        snapshot.error = Some(err);
+        drop(snapshot);
+        publish_snapshot();
+        return;
+    }
+
+    let level_filter = match level.to_lowercase().as_str() {
+        "error" => log::LevelFilter::Error,
+        "warn" => log::LevelFilter::Warn,
+        "info" => log::LevelFilter::Info,
+        "debug" => log::LevelFilter::Debug,
+        _ => log::LevelFilter::Warn,
+    };
+    log::set_max_level(level_filter);
+
+    *state.config.lock().unwrap() = config;
+    refresh_snapshot_from_state(None);
+    publish_snapshot();
+}
+
 fn app(cx: &mut RenderCx) -> Element {
     let initial = shared_snapshot().lock().unwrap().clone();
     let (snapshot, setter) = cx.use_async_state(initial);
     *UI_SETTER.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(setter);
 
-    let body: Element = if snapshot.monitors.is_empty() {
+    let main_inner: Element = if snapshot.monitors.is_empty() {
         vstack((
             subtitle("No compatible monitors"),
             body("Connect a DDC/CI monitor, then refresh."),
@@ -453,11 +522,78 @@ fn app(cx: &mut RenderCx) -> Element {
         vstack((header, controls)).spacing(12.0).into()
     };
 
+    let settings_content: Element = {
+        let header = grid((hstack((
+            button("\u{E76B}")
+                .font_family("Segoe Fluent Icons")
+                .font_size(16.0)
+                .width(32.0)
+                .height(32.0)
+                .padding(0.0)
+                .subtle()
+                .on_click(|| {
+                    shared_snapshot().lock().unwrap().current_view = ActiveView::Main;
+                    publish_snapshot();
+                })
+                .automation_name("Back to main"),
+            body_strong("Settings").vertical_alignment(VerticalAlignment::Center),
+        ))
+        .spacing(8.0)
+        .grid_column(0)
+        .horizontal_alignment(HorizontalAlignment::Left),))
+        .columns([GridLength::STAR, GridLength::Auto])
+        .horizontal_alignment(HorizontalAlignment::Stretch);
+
+        let controls = vstack((
+            ToggleSwitch::new(snapshot.autostart_enabled)
+                .header("Start with Windows")
+                .on_toggled(|value: bool| {
+                    update_autostart(value);
+                })
+                .horizontal_alignment(HorizontalAlignment::Stretch),
+            ComboBox::new(vec!["Error", "Warn", "Info", "Debug"])
+                .header("Log level")
+                .selected_index(match snapshot.log_level.to_lowercase().as_str() {
+                    "error" => 0,
+                    "warn" => 1,
+                    "info" => 2,
+                    "debug" => 3,
+                    _ => 1,
+                })
+                .on_selection_changed(|index: i32| {
+                    let level = match index {
+                        0 => "error",
+                        1 => "warn",
+                        2 => "info",
+                        3 => "debug",
+                        _ => "warn",
+                    };
+                    update_log_level(level.to_string());
+                })
+                .horizontal_alignment(HorizontalAlignment::Stretch),
+            vstack((
+                body_strong(format!("XCreen v{}", env!("CARGO_PKG_VERSION"))),
+                caption("MIT License • © 2026 xerosf. All rights reserved."),
+            ))
+            .spacing(4.0)
+            .margin(Thickness {
+                left: 0.0,
+                top: 16.0,
+                right: 0.0,
+                bottom: 0.0,
+            })
+            .horizontal_alignment(HorizontalAlignment::Left),
+        ))
+        .spacing(12.0);
+
+        vstack((header, controls)).spacing(12.0).into()
+    };
+
     let ambient_id = snapshot
         .selected_monitor()
         .map(|monitor| monitor.id.clone());
     let ambient_enabled = snapshot.ambient_available && ambient_id.is_some();
-    
+
     let refresh_button: Element = if snapshot.refreshing {
         ProgressRing::indeterminate().into()
     } else {
@@ -507,12 +643,10 @@ fn app(cx: &mut RenderCx) -> Element {
             .height(32.0)
             .padding(0.0)
             .subtle()
-            .tooltip("Open config file")
+            .tooltip("Settings")
             .on_click(|| {
-                if let Err(err) = open_config_file() {
-                    shared_snapshot().lock().unwrap().error = Some(err);
-                    publish_snapshot();
-                }
+                shared_snapshot().lock().unwrap().current_view = ActiveView::Settings;
+                publish_snapshot();
             })
             .grid_column(1)
             .horizontal_alignment(HorizontalAlignment::Right),
@@ -530,18 +664,70 @@ fn app(cx: &mut RenderCx) -> Element {
         })
         .unwrap_or_else(|| vstack(()).into());
 
-    let grid_layout = grid((
-        vstack((body, error_element))
+    let main_content: Element = grid((
+        vstack((main_inner, error_element))
             .spacing(16.0)
             .grid_row(0),
-        footer
-            .grid_row(1),
+        footer.grid_row(1),
     ))
     .rows(vec![GridLength::STAR, GridLength::Auto])
-    .row_spacing(16.0);
+    .row_spacing(16.0)
+    .into();
 
-    border(grid_layout)
-        .padding(Thickness { left: 16.0, top: 16.0, right: 16.0, bottom: 16.0 })
+    let gap = 40.0;
+    let content_width = 360.0 - 32.0; // 328.0
+    let slide_amount = content_width + gap;
+    let left_margin = if snapshot.current_view == ActiveView::Settings {
+        -slide_amount
+    } else {
+        0.0
+    };
+
+    let main_opacity = if snapshot.current_view == ActiveView::Main {
+        1.0
+    } else {
+        0.0
+    };
+    let settings_opacity = if snapshot.current_view == ActiveView::Settings {
+        1.0
+    } else {
+        0.0
+    };
+
+    let body: Element = grid((
+        main_content
+            .width(content_width)
+            .opacity(main_opacity)
+            .with_opacity_transition(Duration::from_millis(200))
+            .grid_column(0),
+        settings_content
+            .width(content_width)
+            .opacity(settings_opacity)
+            .with_opacity_transition(Duration::from_millis(200))
+            .grid_column(2),
+    ))
+    .columns([
+        GridLength::Pixel(content_width),
+        GridLength::Pixel(gap),
+        GridLength::Pixel(content_width),
+    ])
+    .width(content_width * 2.0 + gap)
+    .margin(Thickness {
+        left: left_margin,
+        top: 0.0,
+        right: 0.0,
+        bottom: 0.0,
+    })
+    .with_translation_transition(Duration::from_millis(200))
+    .into();
+
+    border(body)
+        .padding(Thickness {
+            left: 16.0,
+            top: 16.0,
+            right: 16.0,
+            bottom: 16.0,
+        })
         .into()
 }
 
@@ -553,17 +739,18 @@ fn set_autostart(enable: bool) -> std::result::Result<(), String> {
             .map_err(|e| format!("Failed to open registry: {e}"))?;
         let exe_path =
             std::env::current_exe().map_err(|e| format!("Failed to get exe path: {e}"))?;
-        key.set_value("xcreen", &format!("\"{}\"", exe_path.display()))
+        key.set_value("XCreen", &format!("\"{}\"", exe_path.display()))
             .map_err(|e| format!("Failed to set registry value: {e}"))?;
     } else if let Ok(key) = hkcu.open_subkey_with_flags(
         r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
         KEY_SET_VALUE,
     ) {
-        let _ = key.delete_value("xcreen");
+        let _ = key.delete_value("XCreen");
     }
     Ok(())
 }
 
+#[allow(dead_code)]
 fn open_config_file() -> std::result::Result<(), String> {
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOW;
@@ -576,16 +763,10 @@ fn open_config_file() -> std::result::Result<(), String> {
     let lpfile = PCWSTR::from_raw(path_u16.as_ptr());
 
     unsafe {
-        let instance = ShellExecuteW(
-            None,
-            windows::core::w!("open"),
-            lpfile,
-            None,
-            None,
-            SW_SHOW,
-        );
+        let instance = ShellExecuteW(None, windows::core::w!("open"), lpfile, None, None, SW_SHOW);
         let status = instance.0 as isize;
-        if status == 31 { // SE_ERR_NOASSOC
+        if status == 31 {
+            // SE_ERR_NOASSOC
             let instance_openas = ShellExecuteW(
                 None,
                 windows::core::w!("openas"),
@@ -596,10 +777,16 @@ fn open_config_file() -> std::result::Result<(), String> {
             );
             let status_openas = instance_openas.0 as isize;
             if status_openas <= 32 {
-                return Err(format!("Failed to open config file: ShellExecuteW(openas) returned {}", status_openas));
+                return Err(format!(
+                    "Failed to open config file: ShellExecuteW(openas) returned {}",
+                    status_openas
+                ));
             }
         } else if status <= 32 {
-            return Err(format!("Failed to open config file: ShellExecuteW(open) returned {}", status));
+            return Err(format!(
+                "Failed to open config file: ShellExecuteW(open) returned {}",
+                status
+            ));
         }
     }
     Ok(())
@@ -615,21 +802,25 @@ fn load_icon() -> std::result::Result<Icon, Box<dyn std::error::Error>> {
 
 unsafe extern "system" fn find_thread_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let mut title_buf = [0u16; 512];
-    let len = unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(hwnd, &mut title_buf) };
+    let len =
+        unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(hwnd, &mut title_buf) };
     let title = String::from_utf16_lossy(&title_buf[..len as usize]);
 
     let mut class_buf = [0u16; 512];
-    let class_len = unsafe { windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hwnd, &mut class_buf) };
+    let class_len =
+        unsafe { windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hwnd, &mut class_buf) };
     let class_name = String::from_utf16_lossy(&class_buf[..class_len as usize]);
 
-    if title == "xcreenFlyout" {
+    if title == "XCreenFlyout" {
         unsafe {
             *(lparam.0 as *mut HWND) = hwnd;
         }
         return BOOL(0); // Stop enumeration
     }
 
-    if !class_name.contains("InputNonClientPointerSource") && !class_name.contains("DesktopWindowTreeSource") {
+    if !class_name.contains("InputNonClientPointerSource")
+        && !class_name.contains("DesktopWindowTreeSource")
+    {
         unsafe {
             let backup_hwnd = lparam.0 as *mut HWND;
             if (*backup_hwnd).0 == 0 {
@@ -747,18 +938,23 @@ fn position_flyout(hwnd: HWND, anchor_x: i32, anchor_y: i32) {
         let gap = (12.0 * dpi as f64 / 96.0).round() as i32;
 
         let (x, y) = calculate_flyout_position(screen, actual_width, actual_height, gap);
-        let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, y, actual_width, actual_height, SWP_NOACTIVATE);
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            x,
+            y,
+            actual_width,
+            actual_height,
+            SWP_NOACTIVATE,
+        );
     }
 }
 
-fn calculate_flyout_position(
-    screen: RECT,
-    width: i32,
-    height: i32,
-    gap: i32,
-) -> (i32, i32) {
-    let x = (screen.right - width - gap).clamp(screen.left, (screen.right - width).max(screen.left));
-    let y = (screen.bottom - height - gap).clamp(screen.top, (screen.bottom - height).max(screen.top));
+fn calculate_flyout_position(screen: RECT, width: i32, height: i32, gap: i32) -> (i32, i32) {
+    let x =
+        (screen.right - width - gap).clamp(screen.left, (screen.right - width).max(screen.left));
+    let y =
+        (screen.bottom - height - gap).clamp(screen.top, (screen.bottom - height).max(screen.top));
     (x, y)
 }
 
@@ -841,7 +1037,7 @@ fn start_tray_event_threads() {
         loop {
             thread::sleep(Duration::from_millis(75));
             let hwnd = HWND(FLYOUT_HWND.load(Ordering::SeqCst));
-            
+
             let is_lbutton_down = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 };
             if !is_lbutton_down {
                 let pending = {
@@ -883,12 +1079,30 @@ fn create_tray() -> std::result::Result<TrayIcon, Box<dyn std::error::Error>> {
     Ok(TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_menu_on_left_click(false)
-        .with_tooltip("xcreen - Monitor Brightness Control")
+        .with_tooltip("XCreen - Monitor Brightness Control")
         .with_icon(load_icon()?)
         .build()?)
 }
 
+fn init_dark_mode() {
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    use windows::core::PCSTR;
+
+    unsafe {
+        if let Ok(uxtheme) = LoadLibraryW(windows::core::w!("uxtheme.dll")) {
+            let ord_135 = PCSTR::from_raw(135 as *const u8);
+            if let Some(set_preferred_app_mode) = GetProcAddress(uxtheme, ord_135) {
+                // PreferredAppMode: AllowDark = 1
+                let set_preferred_app_mode: unsafe extern "system" fn(i32) -> i32 =
+                    std::mem::transmute(set_preferred_app_mode);
+                set_preferred_app_mode(1);
+            }
+        }
+    }
+}
+
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    init_dark_mode();
     windows_reactor::bootstrap()?;
     let config = AppConfig::load().unwrap_or_else(|err| {
         eprintln!("Config load error, using defaults: {err}");
@@ -930,7 +1144,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     App::new().run_custom(|_| {
         let host = ReactorHost::new_with_window_options(
-            "xcreenFlyout",
+            "XCreenFlyout",
             Some(WindowSize {
                 width: FLYOUT_WIDTH_DIP,
                 height: FLYOUT_HEIGHT_DIP,
@@ -945,17 +1159,25 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             |_| {},
         )?;
         host.set_backdrop(Backdrop::Acrylic);
-        
+
         let hwnd = current_thread_window().expect("Unable to find WinUI window");
         FLYOUT_HWND.store(hwnd.0, Ordering::SeqCst);
         configure_flyout_window(hwnd);
-        
+
         // Hide window offscreen initially to prevent startup flash
         let dpi = unsafe { GetDpiForWindow(hwnd).max(96) };
         let width = (FLYOUT_WIDTH_DIP * dpi as f64 / 96.0).round() as i32;
         let height = (FLYOUT_HEIGHT_DIP * dpi as f64 / 96.0).round() as i32;
         unsafe {
-            let _ = SetWindowPos(hwnd, HWND_TOPMOST, -10000, -10000, width, height, SWP_NOACTIVATE);
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                -10000,
+                -10000,
+                width,
+                height,
+                SWP_NOACTIVATE,
+            );
         }
 
         host.activate()?;
@@ -971,7 +1193,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         };
         start_tray_event_threads();
         RUNTIME.with(|runtime| *runtime.borrow_mut() = Some((host, tray)));
-        info!("xcreen started");
+        info!("XCreen started");
         Ok(())
     })?;
     Ok(())
