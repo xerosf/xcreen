@@ -50,13 +50,25 @@ jobs:
         id: bundle
         shell: pwsh
         run: |
-          $ExePath = Join-Path "target/x86_64-pc-windows-msvc/release" "xcreen.exe"
+          $ReleaseDir = "target/x86_64-pc-windows-msvc/release"
+          $ExePath = Join-Path $ReleaseDir "xcreen.exe"
           if (!(Test-Path $ExePath)) { Write-Error "Binary not found: $ExePath" }
-          $ZipName = "xcreen-$(${env:GITHUB_REF_NAME})-${{ steps.version.outputs.version }}-windows-x86_64.zip"
-          # Use a stable file name that doesn't depend on branch name
           $ZipName = "xcreen-${{ steps.version.outputs.version }}-windows-x86_64.zip"
+          $BundleDir = "xcreen-${{ steps.version.outputs.version }}-windows-x86_64"
+          if (Test-Path $BundleDir) { Remove-Item $BundleDir -Recurse -Force }
+          New-Item -ItemType Directory -Path $BundleDir | Out-Null
+
+          # windows-reactor-setup stages the self-contained runtime beside the binary.
+          Get-ChildItem $ReleaseDir -File | Where-Object {
+            $_.Name -eq "xcreen.exe" -or $_.Extension -in ".dll", ".pri", ".xaml"
+          } | Copy-Item -Destination $BundleDir
+          Get-ChildItem $ReleaseDir -Directory | Where-Object {
+            $_.Name -notin "build", "deps", "examples", "incremental"
+          } | Copy-Item -Destination $BundleDir -Recurse
+          Copy-Item LICENSE, README.md -Destination $BundleDir
+
           if (Test-Path $ZipName) { Remove-Item $ZipName -Force }
-          Compress-Archive -Path $ExePath, LICENSE, README.md -DestinationPath $ZipName -Force
+          Compress-Archive -Path $BundleDir -DestinationPath $ZipName -Force
           "zip=$ZipName" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Upload artifact (CI)
@@ -70,7 +82,7 @@ jobs:
         uses: ncipollo/release-action@v1.14.0
         with:
           tag: ${{ steps.version.outputs.tag }}
-          name: XCreen ${{ steps.version.outputs.tag }}
+          name: xcreen ${{ steps.version.outputs.tag }}
           artifacts: ${{ steps.bundle.outputs.zip }}
           artifactContentType: application/zip
           generateReleaseNotes: true

@@ -1,6 +1,8 @@
 fn main() {
     // Only run on Windows
     if cfg!(target_os = "windows") {
+        windows_reactor_setup::as_framework_dependent();
+
         let mut res = winres::WindowsResource::new();
 
         // Set icon if present (expects .ico file)
@@ -26,8 +28,8 @@ fn main() {
         }
 
         // Set some basic metadata
-        res.set("FileDescription", "XCreen - Adaptive Brightness Control");
-        res.set("ProductName", "XCreen");
+        res.set("FileDescription", "xcreen - Adaptive Brightness Control");
+        res.set("ProductName", "xcreen");
         res.set("CompanyName", "Sansith Fernando");
         res.set("LegalCopyright", "Copyright © 2025 Sansith Fernando");
 

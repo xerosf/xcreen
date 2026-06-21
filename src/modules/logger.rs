@@ -93,6 +93,6 @@ pub fn init_logger(log_level: &str) -> Result<(), String> {
     log::set_boxed_logger(Box::new(logger)).map_err(|e| format!("Failed to set logger: {}", e))?;
     log::set_max_level(level);
 
-    log::info!("XCreen logger initialized (level: {})", log_level);
+    log::info!("xcreen logger initialized (level: {})", log_level);
     Ok(())
 }

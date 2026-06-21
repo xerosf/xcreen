@@ -1,9 +1,9 @@
-# XCreen
+# xcreen
 
 **Pure Rust External Monitor Brightness Control**
 
 <p align="center">
-  <img src="src/icons/icon.png" alt="XCreen Logo" width="150" height="150" />
+  <img src="src/icons/icon.png" alt="xcreen Logo" width="150" height="150" />
 </p>
 
 <p align="center">
@@ -15,7 +15,7 @@ A lightweight, native Windows application for automatic brightness control of ex
 ## Features
 
 - **Ambient Light Brightness**: Manually set monitor brightness and contrast based on current ambient light sensor reading
-- **Manual Brightness Profiles**: Set predefined brightness levels (Dim, Normal, Max, etc.)
+- **Direct Monitor Controls**: Adjust brightness and contrast with accessible native sliders
 - **Windows Autostart**: Automatically start the application when Windows boots
 - **Configurable Settings**: All settings stored in a config.json file
 - **Monitor Support**: Works with all DDC/CI compatible external monitors
@@ -26,10 +26,10 @@ A lightweight, native Windows application for automatic brightness control of ex
 
 ### From Release
 
-1. Download the latest `xcreen.exe` from the [Releases](https://github.com/xerosf/xcreen/releases) page
-2. Place the executable in your desired location
+1. Download the latest xcreen release archive from the [Releases](https://github.com/xerosf/xcreen/releases) page
+2. Extract the complete archive to your desired location; xcreen's self-contained WinUI runtime files must remain beside `xcreen.exe`
 3. Run `xcreen.exe`
-4. Right-click the system tray icon to access features
+4. Left-click the system tray icon to open the monitor controls, or right-click it for Open, Refresh, and Exit
 
 ## Configuration
 
@@ -41,21 +41,12 @@ The application uses a `config.json` file located in the same directory as the e
 {
   "autostart_enabled": false,
   "last_brightness": 50,
-  "brightness_profiles": [
+  "monitors": [
     {
-      "name": "Dim",
-      "brightness": 15,
-      "contrast": 30
-    },
-    {
-      "name": "Normal",
-      "brightness": 55,
-      "contrast": 75
-    },
-    {
-      "name": "Max",
-      "brightness": 100,
-      "contrast": 100
+      "id": "display-specific-id",
+      "display_device": "\\\\.\\DISPLAY1",
+      "physical_index": 0,
+      "name": "External Monitor"
     }
   ],
   "log_level": "warn"

@@ -1,9 +1,10 @@
 [package]
 name = "xcreen"
-version = "0.3.0"
+version = "0.4.0"
 description = "External Monitor Brightness Control"
 authors = ["Sansith Fernando"]
 edition = "2024"
+rust-version = "1.95"
 readme = "README.md"
 repository = "https://github.com/xerosf/xcreen"
 license-file = "LICENSE"
@@ -27,7 +28,6 @@ path = "src/main.rs"
 [dependencies]
 # System tray
 tray-icon = "0.21"
-winit = "0.29"
 image = { version = "0.24", default-features = false, features = ["png"] }
 
 # Config persistence
@@ -42,9 +42,16 @@ windows = { version = "0.56.0", features = [
     "Devices_Sensors",
     "Foundation", 
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
     "Win32_System_LibraryLoader",
-    "Win32_UI_WindowsAndMessaging"
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell"
 ] }
+
+windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "2ad09303" }
 
 # Autostart (Windows registry)
 winreg = "0.51"
@@ -54,3 +61,4 @@ notify = "6.1"
 
 [build-dependencies]
 winres = "0.1"
+windows-reactor-setup = { git = "https://github.com/microsoft/windows-rs", rev = "2ad09303" }

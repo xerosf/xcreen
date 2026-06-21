@@ -140,6 +140,12 @@ pub struct MonitorInfo {
     pub cached_contrast: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MonitorLevels {
+    pub brightness: u32,
+    pub contrast: u32,
+}
+
 fn description_to_string(description: &[u16; 128]) -> String {
     String::from_utf16_lossy(
         &description[..description
@@ -274,6 +280,84 @@ pub fn set_monitor_settings_with_cache(
         }
         Err(e) => Err(e),
     }
+}
+
+/// Read the monitor's current DDC/CI brightness and contrast as percentages.
+pub fn get_monitor_levels(monitor_info: &mut MonitorInfo) -> Result<MonitorLevels, String> {
+    let ddc = get_ddc_functions().map_err(|e| format!("DDC/CI error: {e}"))?;
+    let physical_monitors = enumerate_physical_monitors(monitor_info.display_handle)
+        .map_err(|e| format!("Failed to get physical monitor(s): {e}"))?;
+
+    let result = (|| {
+        let pm = physical_monitors
+            .get(monitor_info.physical_index as usize)
+            .ok_or_else(|| {
+                format!(
+                    "Physical monitor index {} no longer exists",
+                    monitor_info.physical_index
+                )
+            })?;
+
+        let to_percent = |value: u32, min: u32, max: u32| -> u32 {
+            if max <= min {
+                return 0;
+            }
+            (((value.saturating_sub(min)) as u64 * 100 + ((max - min) as u64 / 2))
+                / (max - min) as u64) as u32
+        };
+
+        unsafe {
+            let mut min_b = 0;
+            let mut cur_b = 0;
+            let mut max_b = 0;
+            if !(ddc.get_monitor_brightness)(pm.handle, &mut min_b, &mut cur_b, &mut max_b)
+                .as_bool()
+            {
+                return Err("Brightness is not supported by this monitor".to_string());
+            }
+
+            let mut min_c = 0;
+            let mut cur_c = 0;
+            let mut max_c = 0;
+            if !(ddc.get_monitor_contrast)(pm.handle, &mut min_c, &mut cur_c, &mut max_c).as_bool()
+            {
+                return Err("Contrast is not supported by this monitor".to_string());
+            }
+
+            Ok(MonitorLevels {
+                brightness: to_percent(cur_b, min_b, max_b).min(100),
+                contrast: to_percent(cur_c, min_c, max_c).min(100),
+            })
+        }
+    })();
+
+    unsafe {
+        for pm in &physical_monitors {
+            let _ = (ddc.destroy_physical_monitor)(pm.handle);
+        }
+    }
+
+    if let Ok(levels) = result {
+        monitor_info.cached_brightness = Some(levels.brightness);
+        monitor_info.cached_contrast = Some(levels.contrast);
+    }
+    result
+}
+
+pub fn set_monitor_brightness_only(
+    monitor_info: &mut MonitorInfo,
+    brightness: u32,
+) -> Result<bool, String> {
+    let levels = get_monitor_levels(monitor_info)?;
+    set_monitor_settings_with_cache(monitor_info, brightness, levels.contrast)
+}
+
+pub fn set_monitor_contrast_only(
+    monitor_info: &mut MonitorInfo,
+    contrast: u32,
+) -> Result<bool, String> {
+    let levels = get_monitor_levels(monitor_info)?;
+    set_monitor_settings_with_cache(monitor_info, levels.brightness, contrast)
 }
 
 struct ApplyResult {
