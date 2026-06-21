@@ -28,6 +28,10 @@ jobs:
           toolchain: stable
           targets: x86_64-pc-windows-msvc
 
+      # Magic step: Caches the cargo registry, git repos, and target directory
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
       - name: Build (release, x86_64-pc-windows-msvc)
         shell: pwsh
         run: |
@@ -46,10 +50,7 @@ jobs:
           "version=$version" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append -Encoding utf8
           "tag=v$version" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append -Encoding utf8
 
-      - name: Install Inno Setup
-        shell: pwsh
-        run: |
-          choco install innosetup -y
+      # REMOVED: choco install innosetup (It is pre-installed on windows-latest)
 
       - name: Build Installer
         shell: pwsh

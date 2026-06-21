@@ -33,7 +33,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 ; Copy all self-contained dependencies, binaries, localizations, and resources
-Source: "target\x86_64-pc-windows-msvc\release\*"; DestDir: "{app}"; Exclude: "build,deps,examples,incremental,*.pdb,*.d,*.log,config.json"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "target\x86_64-pc-windows-msvc\release\*"; DestDir: "{app}"; Excludes: "build,deps,examples,incremental,*.pdb,*.d,*.log,config.json"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion
 
