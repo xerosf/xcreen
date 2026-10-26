@@ -6,20 +6,25 @@ use std::sync::Mutex;
 
 pub struct FileLogger {
     writer: Mutex<BufWriter<File>>,
-    _level: LevelFilter,
     console_enabled: bool,
 }
 
-impl FileLogger {
-    pub fn new(log_level: &str) -> Result<Self, String> {
-        let level = match log_level.to_lowercase().as_str() {
-            "error" => LevelFilter::Error,
-            "warn" => LevelFilter::Warn,
-            "info" => LevelFilter::Info,
-            "debug" => LevelFilter::Debug,
-            _ => LevelFilter::Warn,
-        };
+fn parse_log_level(log_level: &str) -> LevelFilter {
+    match log_level.to_lowercase().as_str() {
+        "error" => LevelFilter::Error,
+        "warn" => LevelFilter::Warn,
+        "info" => LevelFilter::Info,
+        "debug" => LevelFilter::Debug,
+        _ => LevelFilter::Warn,
+    }
+}
 
+pub fn apply_log_level(log_level: &str) {
+    log::set_max_level(parse_log_level(log_level));
+}
+
+impl FileLogger {
+    pub fn new() -> Result<Self, String> {
         let log_path = Self::get_log_path()?;
 
         let file = OpenOptions::new()
@@ -30,7 +35,6 @@ impl FileLogger {
 
         Ok(FileLogger {
             writer: Mutex::new(BufWriter::new(file)),
-            _level: level,
             console_enabled: cfg!(debug_assertions),
         })
     }
@@ -81,18 +85,23 @@ impl log::Log for FileLogger {
 }
 
 pub fn init_logger(log_level: &str) -> Result<(), String> {
-    let logger = FileLogger::new(log_level)?;
-    let level = match log_level.to_lowercase().as_str() {
-        "error" => LevelFilter::Error,
-        "warn" => LevelFilter::Warn,
-        "info" => LevelFilter::Info,
-        "debug" => LevelFilter::Debug,
-        _ => LevelFilter::Warn,
-    };
+    let logger = FileLogger::new()?;
 
     log::set_boxed_logger(Box::new(logger)).map_err(|e| format!("Failed to set logger: {}", e))?;
-    log::set_max_level(level);
+    apply_log_level(log_level);
 
     log::info!("XCreen logger initialized (level: {})", log_level);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_known_log_levels() {
+        assert_eq!(parse_log_level("debug"), LevelFilter::Debug);
+        assert_eq!(parse_log_level("WARN"), LevelFilter::Warn);
+        assert_eq!(parse_log_level("nope"), LevelFilter::Warn);
+    }
 }

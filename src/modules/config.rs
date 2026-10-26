@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MonitorConfig {
     pub id: String,
     pub display_device: String,
@@ -96,27 +96,25 @@ impl AppConfig {
         Ok(())
     }
 
-    pub fn merge_connected_monitors(
+    /// Store exactly the monitors that are connected now.
+    pub fn sync_connected_monitors(
         &mut self,
         monitors: &[crate::modules::monitor::MonitorInfo],
     ) -> bool {
-        let original_len = self.monitors.len();
-        for monitor in monitors {
-            if self
-                .monitors
-                .iter()
-                .any(|configured| configured.id == monitor.id)
-            {
-                continue;
-            }
-            self.monitors.push(MonitorConfig {
+        let synced = monitors
+            .iter()
+            .map(|monitor| MonitorConfig {
                 id: monitor.id.clone(),
                 display_device: monitor.display_device.clone(),
                 physical_index: monitor.physical_index,
                 name: monitor.name.clone(),
-            });
+            })
+            .collect::<Vec<_>>();
+        if synced == self.monitors {
+            return false;
         }
-        self.monitors.len() != original_len
+        self.monitors = synced;
+        true
     }
 }
 
@@ -152,5 +150,33 @@ mod tests {
             name: "Monitor".into(),
         });
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn sync_drops_stale_generic_identities() {
+        let mut config = AppConfig::default();
+        config.monitors.push(MonitorConfig {
+            id: "old-generic".into(),
+            display_device: r"\\.\DISPLAY1".into(),
+            physical_index: 0,
+            name: "Generic PnP Monitor".into(),
+        });
+        let live = crate::modules::monitor::MonitorInfo {
+            id: r"\\?\DISPLAY#DELL".into(),
+            display_handle: 0,
+            display_device: r"\\.\DISPLAY2".into(),
+            physical_index: 0,
+            name: "Dell P2222H (HDMI)".into(),
+            is_primary: true,
+            cached_brightness: Some(40),
+            cached_contrast: Some(50),
+            level_error: None,
+        };
+        assert!(config.sync_connected_monitors(std::slice::from_ref(&live)));
+        assert_eq!(config.monitors.len(), 1);
+        assert_eq!(config.monitors[0].name, "Dell P2222H (HDMI)");
+        let mut again = live.clone();
+        again.display_handle = 5;
+        assert!(!config.sync_connected_monitors(std::slice::from_ref(&again)));
     }
 }

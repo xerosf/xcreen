@@ -41,6 +41,7 @@ log = { version = "0.4", features = ["std"] }
 windows = { version = "0.56.0", features = [
     "Devices_Sensors",
     "Foundation", 
+    "Win32_Devices_Display",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dwm",
     "Win32_System_LibraryLoader",

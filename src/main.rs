@@ -3,31 +3,33 @@
 mod modules;
 
 use ::image::ImageFormat;
-use log::{error, info};
+use log::{error, info, warn};
 use modules::config::AppConfig;
 use modules::monitor::{MonitorInfo, MonitorLevels};
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicIsize, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tray_icon::{
     Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
     menu::{Menu, MenuItem, PredefinedMenuItem},
 };
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWINDOWATTRIBUTE, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
 };
-use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE, VK_LBUTTON};
+use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumThreadWindows, GWL_EXSTYLE, GWL_STYLE, GetForegroundWindow, GetWindowLongW, GetWindowRect,
+    EnumThreadWindows, GA_ROOTOWNER, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetAncestor,
+    GetForegroundWindow, GetParent, GetWindow, GetWindowLongW, GetWindowRect,
     GetWindowThreadProcessId, HWND_TOPMOST, IsWindowVisible, PostMessageW, SW_HIDE, SW_SHOW,
     SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow, SetWindowLongW,
-    SetWindowPos, ShowWindow, WM_CANCELMODE, WS_CAPTION, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    SetWindowPos, ShowWindow, WM_APP, WM_CANCELMODE, WS_CAPTION, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
     WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
 };
 use windows_reactor::*;
@@ -36,6 +38,11 @@ use winreg::enums::*;
 
 const FLYOUT_WIDTH_DIP: f64 = 360.0;
 const FLYOUT_HEIGHT_DIP: f64 = 280.0;
+/// The click that opens the flyout also moves foreground. Hiding on that
+/// focus change would close the window before it is visible.
+const FLYOUT_DISMISS_GRACE: Duration = Duration::from_millis(400);
+const WM_SHOW_FLYOUT: u32 = WM_APP + 1;
+const WM_HIDE_FLYOUT: u32 = WM_APP + 2;
 
 #[derive(Clone)]
 struct AppState {
@@ -80,6 +87,7 @@ struct UiSnapshot {
     current_view: ActiveView,
     autostart_enabled: bool,
     log_level: String,
+    user_selected: bool,
 }
 
 impl UiSnapshot {
@@ -96,6 +104,7 @@ impl UiSnapshot {
             current_view: ActiveView::Main,
             autostart_enabled: false,
             log_level: "warn".to_string(),
+            user_selected: false,
         }
     }
 
@@ -109,6 +118,10 @@ static UI_SETTER: OnceLock<Mutex<Option<AsyncSetState<UiSnapshot>>>> = OnceLock:
 static APP_STATE: OnceLock<AppState> = OnceLock::new();
 static FLYOUT_HWND: AtomicIsize = AtomicIsize::new(0);
 static LOAD_GENERATION: AtomicU64 = AtomicU64::new(0);
+static REFRESH_GENERATION: AtomicU64 = AtomicU64::new(0);
+static ANCHOR_X: AtomicI32 = AtomicI32::new(0);
+static ANCHOR_Y: AtomicI32 = AtomicI32::new(0);
+static SHOWN_AT: Mutex<Option<Instant>> = Mutex::new(None);
 static PENDING_COMMIT: Mutex<Option<(String, LevelKind, u32)>> = Mutex::new(None);
 
 thread_local! {
@@ -126,58 +139,133 @@ fn publish_snapshot() {
     }
 }
 
+fn choose_selected_index(
+    monitors: &[UiMonitor],
+    has_levels: &[bool],
+    preserve_id: Option<&str>,
+    user_selected: bool,
+) -> usize {
+    if monitors.is_empty() {
+        return 0;
+    }
+    if user_selected
+        && let Some(id) = preserve_id
+        && let Some(index) = monitors.iter().position(|monitor| monitor.id == id)
+    {
+        return index;
+    }
+    if let Some(index) = monitors
+        .iter()
+        .zip(has_levels.iter())
+        .position(|(monitor, ready)| monitor.is_primary && *ready)
+    {
+        return index;
+    }
+    if let Some(index) = has_levels.iter().position(|ready| *ready) {
+        return index;
+    }
+    if let Some(id) = preserve_id
+        && let Some(index) = monitors.iter().position(|monitor| monitor.id == id)
+    {
+        return index;
+    }
+    0
+}
+
 fn refresh_snapshot_from_state(preserve_id: Option<&str>) {
     let state = APP_STATE.get().expect("app state is initialized");
     let monitors = state.monitors.lock().unwrap();
-    let mut ui_monitors: Vec<UiMonitor> = monitors
+    let mut entries: Vec<(UiMonitor, bool, Option<MonitorLevels>, Option<String>)> = monitors
         .iter()
-        .map(|monitor| UiMonitor {
-            id: monitor.id.clone(),
-            name: monitor.name.clone(),
-            is_primary: monitor.is_primary,
+        .map(|monitor| {
+            let levels = monitor.cached_levels();
+            (
+                UiMonitor {
+                    id: monitor.id.clone(),
+                    name: monitor.name.clone(),
+                    is_primary: monitor.is_primary,
+                },
+                levels.is_some(),
+                levels,
+                monitor.level_error.clone(),
+            )
         })
         .collect();
-    ui_monitors.sort_by_key(|monitor| !monitor.is_primary);
+    drop(monitors);
+    entries.sort_by_key(|entry| !entry.0.is_primary);
+
+    let ambient_available = *state.ambient_light_available.lock().unwrap();
+    let (autostart_enabled, log_level) = {
+        let config = state.config.lock().unwrap();
+        (config.autostart_enabled, config.log_level.clone())
+    };
 
     let mut snapshot = shared_snapshot().lock().unwrap();
-    let selected_id = preserve_id.map(str::to_owned).or_else(|| {
+    let preserve = preserve_id.map(str::to_owned).or_else(|| {
         snapshot
             .selected_monitor()
             .map(|monitor| monitor.id.clone())
     });
+    let previous_levels = snapshot.levels;
+    let previous_id = snapshot
+        .selected_monitor()
+        .map(|monitor| monitor.id.clone());
+    let user_selected = snapshot.user_selected;
 
-    let prev_selected_id = snapshot.selected_monitor().map(|m| m.id.clone());
-    let id_changed =
-        prev_selected_id.is_none() || selected_id.is_none() || prev_selected_id != selected_id;
-
+    let ui_monitors: Vec<UiMonitor> = entries.iter().map(|entry| entry.0.clone()).collect();
+    let has_levels: Vec<bool> = entries.iter().map(|entry| entry.1).collect();
     snapshot.monitors = ui_monitors;
-    snapshot.selected = selected_id
-        .as_deref()
-        .and_then(|id| {
-            snapshot
-                .monitors
-                .iter()
-                .position(|monitor| monitor.id == id)
-        })
-        .unwrap_or(0);
-    if id_changed {
+    snapshot.selected = choose_selected_index(
+        &snapshot.monitors,
+        &has_levels,
+        preserve.as_deref(),
+        user_selected,
+    );
+    let selected_id = snapshot
+        .selected_monitor()
+        .map(|monitor| monitor.id.clone());
+    snapshot.user_selected = user_selected
+        && preserve.as_deref().is_some()
+        && selected_id.as_deref() == preserve.as_deref();
+
+    let cached = selected_id.as_ref().and_then(|id| {
+        entries
+            .iter()
+            .find(|entry| entry.0.id == *id)
+            .and_then(|entry| entry.2)
+    });
+    let level_error = selected_id.as_ref().and_then(|id| {
+        entries
+            .iter()
+            .find(|entry| entry.0.id == *id)
+            .and_then(|entry| entry.3.clone())
+    });
+    let same_monitor = previous_id.is_some() && previous_id == selected_id;
+    if let Some(levels) = cached {
+        snapshot.levels = Some(levels);
+        snapshot.error = None;
+    } else if same_monitor && previous_levels.is_some() {
+        snapshot.levels = previous_levels;
+        snapshot.error = None;
+    } else {
         snapshot.levels = None;
+        snapshot.error = level_error;
     }
+
     snapshot.loading = false;
     snapshot.refreshing = false;
-    snapshot.error = None;
-    snapshot.ambient_available = *state.ambient_light_available.lock().unwrap();
-
-    let config = state.config.lock().unwrap();
-    snapshot.autostart_enabled = config.autostart_enabled;
-    snapshot.log_level = config.log_level.clone();
+    snapshot.load_generation = LOAD_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    snapshot.ambient_available = ambient_available;
+    snapshot.autostart_enabled = autostart_enabled;
+    snapshot.log_level = log_level;
 }
 
 fn refresh_monitors_sync(state: &AppState) -> std::result::Result<(), String> {
-    let monitor_list = modules::monitor::get_monitor_list_sync()?;
+    let previous = state.monitors.lock().unwrap().clone();
+    let monitor_list = modules::monitor::get_monitor_list_sync(&previous)?;
     {
         let mut config = state.config.lock().unwrap();
-        if config.merge_connected_monitors(&monitor_list) {
+        if config.sync_connected_monitors(&monitor_list) {
             config.save()?;
         }
     }
@@ -186,34 +274,50 @@ fn refresh_monitors_sync(state: &AppState) -> std::result::Result<(), String> {
 }
 
 fn refresh_monitors_async(explicit: bool) {
+    let generation = REFRESH_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     {
         let mut snapshot = shared_snapshot().lock().unwrap();
-        snapshot.loading = true;
         if explicit {
             snapshot.refreshing = true;
         }
-        snapshot.error = None;
+        if snapshot.levels.is_none() {
+            snapshot.loading = true;
+            snapshot.error = None;
+        }
+        snapshot.load_generation = LOAD_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     }
     publish_snapshot();
 
-    thread::spawn(|| {
+    thread::spawn(move || {
         let state = APP_STATE.get().expect("app state is initialized");
         let selected = shared_snapshot()
             .lock()
             .unwrap()
             .selected_monitor()
             .map(|monitor| monitor.id.clone());
+        if REFRESH_GENERATION.load(Ordering::SeqCst) != generation {
+            return;
+        }
         match refresh_monitors_sync(state) {
             Ok(()) => {
+                if REFRESH_GENERATION.load(Ordering::SeqCst) != generation {
+                    return;
+                }
                 refresh_snapshot_from_state(selected.as_deref());
                 publish_snapshot();
-                load_selected_levels();
             }
             Err(err) => {
+                if REFRESH_GENERATION.load(Ordering::SeqCst) != generation {
+                    return;
+                }
                 let mut snapshot = shared_snapshot().lock().unwrap();
                 snapshot.loading = false;
                 snapshot.refreshing = false;
-                snapshot.error = Some(err);
+                if snapshot.levels.is_none() {
+                    snapshot.error = Some(err);
+                } else {
+                    warn!("Monitor refresh failed; keeping the last good reading: {err}");
+                }
                 drop(snapshot);
                 publish_snapshot();
             }
@@ -245,12 +349,26 @@ fn load_selected_levels() {
     thread::spawn(move || {
         let result = {
             let state = APP_STATE.get().expect("app state is initialized");
-            let mut monitors = state.monitors.lock().unwrap();
-            monitors
-                .iter_mut()
-                .find(|monitor| monitor.id == monitor_id)
-                .ok_or_else(|| "The selected monitor is no longer connected".to_string())
-                .and_then(modules::monitor::get_monitor_levels)
+            let probe = {
+                let monitors = state.monitors.lock().unwrap();
+                monitors
+                    .iter()
+                    .find(|monitor| monitor.id == monitor_id)
+                    .map(|monitor| (monitor.display_handle, monitor.physical_index))
+            };
+            match probe {
+                Some((handle, index)) => modules::monitor::read_monitor_levels(handle, index),
+                None => Err("The selected monitor is no longer connected".to_string()),
+            }
+            .inspect(|levels| {
+                let mut monitors = state.monitors.lock().unwrap();
+                if let Some(monitor) = monitors.iter_mut().find(|monitor| monitor.id == monitor_id)
+                {
+                    monitor.cached_brightness = Some(levels.brightness);
+                    monitor.cached_contrast = Some(levels.contrast);
+                    monitor.level_error = None;
+                }
+            })
         };
         let mut snapshot = shared_snapshot().lock().unwrap();
         if snapshot.load_generation != generation
@@ -260,10 +378,19 @@ fn load_selected_levels() {
         }
         snapshot.loading = false;
         match result {
-            Ok(levels) => snapshot.levels = Some(levels),
+            Ok(levels) => {
+                snapshot.levels = Some(levels);
+                snapshot.error = None;
+            }
             Err(err) => {
-                snapshot.levels = None;
-                snapshot.error = Some(err);
+                let disconnected = err.contains("no longer connected");
+                if disconnected || snapshot.levels.is_none() {
+                    snapshot.levels = None;
+                    snapshot.error = Some(err);
+                } else {
+                    warn!("Monitor read failed; keeping the last good levels: {err}");
+                    snapshot.error = None;
+                }
             }
         }
         drop(snapshot);
@@ -281,24 +408,71 @@ fn commit_level(monitor_id: String, kind: LevelKind, value: u32) {
     thread::spawn(move || {
         let result = {
             let state = APP_STATE.get().expect("app state is initialized");
-            let mut monitors = state.monitors.lock().unwrap();
-            let monitor = monitors
-                .iter_mut()
-                .find(|monitor| monitor.id == monitor_id)
-                .ok_or_else(|| "The selected monitor is no longer connected".to_string());
-            monitor.and_then(|monitor| match kind {
-                LevelKind::Brightness => {
-                    modules::monitor::set_monitor_brightness_only(monitor, value)
+            let probe = {
+                let monitors = state.monitors.lock().unwrap();
+                monitors
+                    .iter()
+                    .find(|monitor| monitor.id == monitor_id)
+                    .map(|monitor| {
+                        (
+                            monitor.display_handle,
+                            monitor.physical_index,
+                            monitor.cached_brightness,
+                            monitor.cached_contrast,
+                        )
+                    })
+            };
+            match probe {
+                Some((handle, index, cached_brightness, cached_contrast)) => {
+                    let resolved = match kind {
+                        LevelKind::Brightness => match cached_contrast {
+                            Some(contrast) => Ok((value, contrast)),
+                            None => modules::monitor::read_monitor_levels(handle, index)
+                                .map(|levels| (value, levels.contrast)),
+                        },
+                        LevelKind::Contrast => match cached_brightness {
+                            Some(brightness) => Ok((brightness, value)),
+                            None => modules::monitor::read_monitor_levels(handle, index)
+                                .map(|levels| (levels.brightness, value)),
+                        },
+                    };
+                    resolved.and_then(|(brightness, contrast)| {
+                        modules::monitor::apply_cached_levels(
+                            handle,
+                            index,
+                            brightness,
+                            contrast,
+                            cached_brightness,
+                            cached_contrast,
+                        )
+                    })
                 }
-                LevelKind::Contrast => modules::monitor::set_monitor_contrast_only(monitor, value),
+                None => Err("The selected monitor is no longer connected".to_string()),
+            }
+            .inspect(|levels| {
+                let mut monitors = state.monitors.lock().unwrap();
+                if let Some(monitor) = monitors.iter_mut().find(|monitor| monitor.id == monitor_id)
+                {
+                    monitor.cached_brightness = Some(levels.brightness);
+                    monitor.cached_contrast = Some(levels.contrast);
+                    monitor.level_error = None;
+                }
             })
         };
-        if let Err(err) = result {
-            shared_snapshot().lock().unwrap().error = Some(err);
-            publish_snapshot();
-        } else {
-            load_selected_levels();
+        let mut snapshot = shared_snapshot().lock().unwrap();
+        if snapshot
+            .selected_monitor()
+            .map(|monitor| monitor.id.as_str())
+            != Some(monitor_id.as_str())
+        {
+            return;
         }
+        match result {
+            Ok(_) => snapshot.error = None,
+            Err(err) => snapshot.error = Some(err),
+        }
+        drop(snapshot);
+        publish_snapshot();
     });
 }
 
@@ -319,16 +493,61 @@ fn apply_ambient(monitor_id: String) {
                 x if x < 1000.0 => (80, 85),
                 _ => (100, 95),
             };
-            let mut monitors = state.monitors.lock().unwrap();
-            let monitor = monitors
+            let probe = {
+                let monitors = state.monitors.lock().unwrap();
+                monitors
+                    .iter()
+                    .find(|monitor| monitor.id == monitor_id)
+                    .map(|monitor| {
+                        (
+                            monitor.display_handle,
+                            monitor.physical_index,
+                            monitor.cached_brightness,
+                            monitor.cached_contrast,
+                        )
+                    })
+            };
+            let (handle, index, cached_brightness, cached_contrast) =
+                probe.ok_or_else(|| "The selected monitor is no longer connected".to_string())?;
+            let levels = modules::monitor::apply_cached_levels(
+                handle,
+                index,
+                brightness,
+                contrast,
+                cached_brightness,
+                cached_contrast,
+            )?;
+            if let Some(monitor) = state
+                .monitors
+                .lock()
+                .unwrap()
                 .iter_mut()
                 .find(|monitor| monitor.id == monitor_id)
-                .ok_or_else(|| "The selected monitor is no longer connected".to_string())?;
-            modules::monitor::set_monitor_settings_with_cache(monitor, brightness, contrast)?;
-            Ok(())
+            {
+                monitor.cached_brightness = Some(levels.brightness);
+                monitor.cached_contrast = Some(levels.contrast);
+                monitor.level_error = None;
+            }
+            Ok((levels.brightness, levels.contrast))
         })();
         match result {
-            Ok(()) => load_selected_levels(),
+            Ok((brightness, contrast)) => {
+                let mut snapshot = shared_snapshot().lock().unwrap();
+                if snapshot
+                    .selected_monitor()
+                    .map(|monitor| monitor.id.as_str())
+                    == Some(monitor_id.as_str())
+                {
+                    snapshot.levels = Some(MonitorLevels {
+                        brightness,
+                        contrast,
+                    });
+                    snapshot.loading = false;
+                    snapshot.error = None;
+                }
+                drop(snapshot);
+                publish_snapshot();
+            }
             Err(err) => {
                 shared_snapshot().lock().unwrap().error = Some(err);
                 publish_snapshot();
@@ -338,16 +557,45 @@ fn apply_ambient(monitor_id: String) {
 }
 
 fn navigate_monitor(delta: isize) {
-    {
+    let selected_id = {
         let mut snapshot = shared_snapshot().lock().unwrap();
         let count = snapshot.monitors.len();
         if count == 0 {
             return;
         }
+        snapshot.user_selected = true;
         snapshot.selected =
             (snapshot.selected as isize + delta).rem_euclid(count as isize) as usize;
         snapshot.levels = None;
         snapshot.error = None;
+        snapshot
+            .selected_monitor()
+            .map(|monitor| monitor.id.clone())
+    };
+    let cached = selected_id.as_deref().and_then(|id| {
+        APP_STATE.get().and_then(|state| {
+            state.monitors.lock().ok().and_then(|monitors| {
+                monitors
+                    .iter()
+                    .find(|monitor| monitor.id == id)
+                    .and_then(|monitor| monitor.cached_levels())
+            })
+        })
+    });
+    if let Some(levels) = cached {
+        let mut snapshot = shared_snapshot().lock().unwrap();
+        if snapshot
+            .selected_monitor()
+            .map(|monitor| monitor.id.as_str())
+            == selected_id.as_deref()
+        {
+            snapshot.levels = Some(levels);
+            snapshot.loading = false;
+            snapshot.error = None;
+        }
+        drop(snapshot);
+        publish_snapshot();
+        return;
     }
     publish_snapshot();
     load_selected_levels();
@@ -355,11 +603,19 @@ fn navigate_monitor(delta: isize) {
 
 fn update_local_level(kind: LevelKind, value: u32) {
     let mut snapshot = shared_snapshot().lock().unwrap();
-    let monitor_id = snapshot.selected_monitor().map(|m| m.id.clone());
-    let mut levels = snapshot.levels.unwrap_or(MonitorLevels {
-        brightness: 0,
-        contrast: 0,
-    });
+    let monitor_id = snapshot
+        .selected_monitor()
+        .map(|monitor| monitor.id.clone());
+    let Some(mut levels) = snapshot.levels else {
+        return;
+    };
+    let changed = match kind {
+        LevelKind::Brightness => levels.brightness != value,
+        LevelKind::Contrast => levels.contrast != value,
+    };
+    if !changed {
+        return;
+    }
     match kind {
         LevelKind::Brightness => levels.brightness = value,
         LevelKind::Contrast => levels.contrast = value,
@@ -373,8 +629,21 @@ fn update_local_level(kind: LevelKind, value: u32) {
     }
 }
 
+fn apply_settings_to_snapshot(autostart_enabled: bool, log_level: &str) {
+    let mut snapshot = shared_snapshot().lock().unwrap();
+    snapshot.autostart_enabled = autostart_enabled;
+    snapshot.log_level = log_level.to_string();
+}
+
+fn settings_are_open() -> bool {
+    shared_snapshot().lock().unwrap().current_view == ActiveView::Settings
+}
+
 fn update_autostart(enable: bool) {
     let state = APP_STATE.get().expect("app state is initialized");
+    if state.config.lock().unwrap().autostart_enabled == enable {
+        return;
+    }
     let mut config = state.config.lock().unwrap().clone();
     config.autostart_enabled = enable;
     if let Err(err) = config.save() {
@@ -393,13 +662,22 @@ fn update_autostart(enable: bool) {
         publish_snapshot();
         return;
     }
-    *state.config.lock().unwrap() = config;
-    refresh_snapshot_from_state(None);
+    *state.config.lock().unwrap() = config.clone();
+    apply_settings_to_snapshot(config.autostart_enabled, &config.log_level);
     publish_snapshot();
 }
 
 fn update_log_level(level: String) {
     let state = APP_STATE.get().expect("app state is initialized");
+    if state
+        .config
+        .lock()
+        .unwrap()
+        .log_level
+        .eq_ignore_ascii_case(&level)
+    {
+        return;
+    }
     let mut config = state.config.lock().unwrap().clone();
     config.log_level = level.clone();
     if let Err(err) = config.save() {
@@ -411,17 +689,10 @@ fn update_log_level(level: String) {
         return;
     }
 
-    let level_filter = match level.to_lowercase().as_str() {
-        "error" => log::LevelFilter::Error,
-        "warn" => log::LevelFilter::Warn,
-        "info" => log::LevelFilter::Info,
-        "debug" => log::LevelFilter::Debug,
-        _ => log::LevelFilter::Warn,
-    };
-    log::set_max_level(level_filter);
+    modules::logger::apply_log_level(&level);
 
-    *state.config.lock().unwrap() = config;
-    refresh_snapshot_from_state(None);
+    *state.config.lock().unwrap() = config.clone();
+    apply_settings_to_snapshot(config.autostart_enabled, &config.log_level);
     publish_snapshot();
 }
 
@@ -548,7 +819,9 @@ fn app(cx: &mut RenderCx) -> Element {
             ToggleSwitch::new(snapshot.autostart_enabled)
                 .header("Start with Windows")
                 .on_toggled(|value: bool| {
-                    update_autostart(value);
+                    if settings_are_open() {
+                        update_autostart(value);
+                    }
                 })
                 .horizontal_alignment(HorizontalAlignment::Stretch),
             ComboBox::new(vec!["Error", "Warn", "Info", "Debug"])
@@ -561,6 +834,9 @@ fn app(cx: &mut RenderCx) -> Element {
                     _ => 1,
                 })
                 .on_selection_changed(|index: i32| {
+                    if !settings_are_open() {
+                        return;
+                    }
                     let level = match index {
                         0 => "error",
                         1 => "warn",
@@ -971,6 +1247,103 @@ fn dismiss_tray_menu() {
     }
 }
 
+fn window_belongs_to_flyout(flyout: HWND, candidate: HWND) -> bool {
+    if flyout.0 == 0 || candidate.0 == 0 {
+        return false;
+    }
+    if candidate == flyout {
+        return true;
+    }
+    unsafe {
+        if GetAncestor(candidate, GA_ROOTOWNER) == flyout {
+            return true;
+        }
+        let mut current = candidate;
+        for _ in 0..8 {
+            let owner = GetWindow(current, GW_OWNER);
+            let parent = GetParent(current);
+            let next = if owner.0 != 0 { owner } else { parent };
+            if next.0 == 0 || next == current {
+                break;
+            }
+            if next == flyout {
+                return true;
+            }
+            current = next;
+        }
+    }
+    false
+}
+
+fn force_foreground(hwnd: HWND) {
+    unsafe {
+        let foreground = GetForegroundWindow();
+        let foreground_thread = GetWindowThreadProcessId(foreground, None);
+        let current = GetCurrentThreadId();
+        let attached = foreground_thread != 0
+            && foreground_thread != current
+            && AttachThreadInput(foreground_thread, current, true).as_bool();
+        let _ = SetForegroundWindow(hwnd);
+        if attached {
+            let _ = AttachThreadInput(foreground_thread, current, false);
+        }
+    }
+}
+
+unsafe extern "system" fn flyout_subclass(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    match msg {
+        WM_SHOW_FLYOUT => {
+            *SHOWN_AT.lock().unwrap() = Some(Instant::now());
+            let x = ANCHOR_X.load(Ordering::SeqCst);
+            let y = ANCHOR_Y.load(Ordering::SeqCst);
+            position_flyout(hwnd, x, y);
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_SHOW);
+            }
+            force_foreground(hwnd);
+            LRESULT(0)
+        }
+        WM_HIDE_FLYOUT => {
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+            LRESULT(0)
+        }
+        _ => unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) },
+    }
+}
+
+fn request_show_flyout(anchor_x: i32, anchor_y: i32) {
+    let hwnd = HWND(FLYOUT_HWND.load(Ordering::SeqCst));
+    if hwnd.0 == 0 {
+        return;
+    }
+    ANCHOR_X.store(anchor_x, Ordering::SeqCst);
+    ANCHOR_Y.store(anchor_y, Ordering::SeqCst);
+    unsafe {
+        dismiss_tray_menu();
+        let _ = PostMessageW(hwnd, WM_SHOW_FLYOUT, None, None);
+    }
+    refresh_monitors_async(false);
+}
+
+fn request_hide_flyout() {
+    let hwnd = HWND(FLYOUT_HWND.load(Ordering::SeqCst));
+    if hwnd.0 == 0 {
+        return;
+    }
+    unsafe {
+        let _ = PostMessageW(hwnd, WM_HIDE_FLYOUT, None, None);
+    }
+}
+
 fn toggle_flyout(anchor_x: i32, anchor_y: i32) {
     let hwnd = HWND(FLYOUT_HWND.load(Ordering::SeqCst));
     if hwnd.0 == 0 {
@@ -978,31 +1351,19 @@ fn toggle_flyout(anchor_x: i32, anchor_y: i32) {
     }
     unsafe {
         if IsWindowVisible(hwnd).as_bool() {
-            let _ = ShowWindow(hwnd, SW_HIDE);
+            request_hide_flyout();
         } else {
-            dismiss_tray_menu();
-            position_flyout(hwnd, anchor_x, anchor_y);
-            refresh_monitors_async(false);
-            let _ = ShowWindow(hwnd, SW_SHOW);
-            let _ = SetForegroundWindow(hwnd);
+            request_show_flyout(anchor_x, anchor_y);
         }
     }
 }
 
 fn show_flyout_default() {
-    let hwnd = HWND(FLYOUT_HWND.load(Ordering::SeqCst));
-    if hwnd.0 == 0 {
-        return;
-    }
     let mut cursor_point = POINT::default();
     unsafe {
-        dismiss_tray_menu();
         let _ = windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut cursor_point);
-        position_flyout(hwnd, cursor_point.x, cursor_point.y);
-        let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = SetForegroundWindow(hwnd);
     }
-    refresh_monitors_async(false);
+    request_show_flyout(cursor_point.x, cursor_point.y);
 }
 
 fn start_tray_event_threads() {
@@ -1055,9 +1416,20 @@ fn start_tray_event_threads() {
             unsafe {
                 if IsWindowVisible(hwnd).as_bool() {
                     let escaped = GetAsyncKeyState(VK_ESCAPE.0 as i32) < 0;
+                    if escaped {
+                        request_hide_flyout();
+                        continue;
+                    }
+                    let shown_recently = SHOWN_AT
+                        .lock()
+                        .unwrap()
+                        .is_some_and(|shown| shown.elapsed() < FLYOUT_DISMISS_GRACE);
+                    if shown_recently {
+                        continue;
+                    }
                     let foreground = GetForegroundWindow();
-                    if escaped || foreground != hwnd {
-                        let _ = ShowWindow(hwnd, SW_HIDE);
+                    if !window_belongs_to_flyout(hwnd, foreground) {
+                        request_hide_flyout();
                     }
                 }
             }
@@ -1128,16 +1500,27 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     refresh_snapshot_from_state(None);
 
     let watcher_state = APP_STATE.get().unwrap().clone();
-    let _watcher = modules::watcher::start_config_watcher(move |mut config| {
-        let monitors = watcher_state.monitors.lock().unwrap().clone();
-        if config.merge_connected_monitors(&monitors) {
-            let _ = config.save();
+    let _watcher = modules::watcher::start_config_watcher(move |config| {
+        let mut current = watcher_state.config.lock().unwrap();
+        let autostart_changed = current.autostart_enabled != config.autostart_enabled;
+        let log_changed = !current.log_level.eq_ignore_ascii_case(&config.log_level);
+        if !autostart_changed && !log_changed {
+            return;
         }
-        if let Err(err) = set_autostart(config.autostart_enabled) {
+        current.autostart_enabled = config.autostart_enabled;
+        current.log_level = config.log_level.clone();
+        let autostart_enabled = current.autostart_enabled;
+        let log_level = current.log_level.clone();
+        drop(current);
+
+        if autostart_changed && let Err(err) = set_autostart(autostart_enabled) {
             error!("Failed to apply autostart configuration: {err}");
         }
-        *watcher_state.config.lock().unwrap() = config;
-        refresh_snapshot_from_state(None);
+        if log_changed {
+            modules::logger::apply_log_level(&log_level);
+            info!("Log level updated to {log_level}");
+        }
+        apply_settings_to_snapshot(autostart_enabled, &log_level);
         publish_snapshot();
     });
 
@@ -1162,6 +1545,9 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let hwnd = current_thread_window().expect("Unable to find WinUI window");
         FLYOUT_HWND.store(hwnd.0, Ordering::SeqCst);
         configure_flyout_window(hwnd);
+        unsafe {
+            let _ = SetWindowSubclass(hwnd, Some(flyout_subclass), 1, 0);
+        }
 
         // Hide window offscreen initially to prevent startup flash
         let dpi = unsafe { GetDpiForWindow(hwnd).max(96) };
@@ -1232,6 +1618,30 @@ mod tests {
         ];
         monitors.sort_by_key(|monitor| !monitor.is_primary);
         assert_eq!(monitors[0].id, "primary");
+    }
+
+    #[test]
+    fn opening_selects_controllable_monitor_over_failing_primary() {
+        let monitors = [
+            UiMonitor {
+                id: "laptop".into(),
+                name: "Generic PnP Monitor".into(),
+                is_primary: true,
+            },
+            UiMonitor {
+                id: "dell".into(),
+                name: "Dell P2222H (HDMI)".into(),
+                is_primary: false,
+            },
+        ];
+        assert_eq!(
+            choose_selected_index(&monitors, &[false, true], Some("laptop"), false),
+            1
+        );
+        assert_eq!(
+            choose_selected_index(&monitors, &[true, true], Some("dell"), true),
+            1
+        );
     }
 
     #[test]
