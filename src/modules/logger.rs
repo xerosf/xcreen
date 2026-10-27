@@ -1,18 +1,27 @@
 use log::{LevelFilter, Metadata, Record};
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+const MAX_LOG_BYTES: u64 = 1024 * 1024;
+
+fn write_bounded(file: &mut File, entry: &[u8], limit: u64) -> std::io::Result<()> {
+    if file.metadata()?.len().saturating_add(entry.len() as u64) > limit {
+        file.set_len(0)?;
+    }
+    file.seek(SeekFrom::End(0))?;
+    file.write_all(&entry[..entry.len().min(limit as usize)])
+}
+
 pub struct FileLogger {
-    writer: Mutex<BufWriter<File>>,
+    writer: Mutex<Option<File>>,
     console_enabled: bool,
 }
 
 fn parse_log_level(log_level: &str) -> LevelFilter {
     match log_level.to_lowercase().as_str() {
         "error" => LevelFilter::Error,
-        "warn" => LevelFilter::Warn,
         "info" => LevelFilter::Info,
         "debug" => LevelFilter::Debug,
         _ => LevelFilter::Warn,
@@ -29,12 +38,13 @@ impl FileLogger {
 
         let file = OpenOptions::new()
             .create(true)
-            .append(true)
+            .write(true)
+            .truncate(false)
             .open(&log_path)
             .map_err(|e| format!("Failed to create log file '{}': {}", log_path.display(), e))?;
 
         Ok(FileLogger {
-            writer: Mutex::new(BufWriter::new(file)),
+            writer: Mutex::new(Some(file)),
             console_enabled: cfg!(debug_assertions),
         })
     }
@@ -52,11 +62,11 @@ impl FileLogger {
 }
 
 impl log::Log for FileLogger {
-    fn enabled(&self, metadata: &Metadata) -> bool {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
         metadata.level() <= log::max_level()
     }
 
-    fn log(&self, record: &Record) {
+    fn log(&self, record: &Record<'_>) {
         if self.enabled(record.metadata()) {
             let log_line = format!(
                 "[{}] {} [{}] {}\n",
@@ -66,37 +76,69 @@ impl log::Log for FileLogger {
                 record.args()
             );
 
-            if let Ok(mut writer) = self.writer.lock() {
-                let _ = writer.write_all(log_line.as_bytes());
-                let _ = writer.flush();
+            if let Ok(mut writer) = self.writer.lock()
+                && let Some(file) = writer.as_mut()
+            {
+                let _ = write_bounded(file, log_line.as_bytes(), MAX_LOG_BYTES);
             }
 
             if self.console_enabled {
-                eprint!("{}", log_line);
+                let _ = std::io::stderr().lock().write_all(log_line.as_bytes());
             }
         }
     }
 
     fn flush(&self) {
-        if let Ok(mut writer) = self.writer.lock() {
-            let _ = writer.flush();
+        if let Ok(mut writer) = self.writer.lock()
+            && let Some(file) = writer.as_mut()
+        {
+            let _ = file.flush();
         }
     }
 }
 
 pub fn init_logger(log_level: &str) -> Result<(), String> {
-    let logger = FileLogger::new()?;
+    let (logger, file_error) = match FileLogger::new() {
+        Ok(logger) => (logger, None),
+        Err(err) => (
+            FileLogger {
+                writer: Mutex::new(None),
+                console_enabled: true,
+            },
+            Some(err),
+        ),
+    };
 
     log::set_boxed_logger(Box::new(logger)).map_err(|e| format!("Failed to set logger: {}", e))?;
     apply_log_level(log_level);
+    if let Some(err) = file_error {
+        tracing::warn!("File logging unavailable: {err}");
+    }
 
-    log::info!("XCreen logger initialized (level: {})", log_level);
+    tracing::info!("XCreen logger initialized (level: {})", log_level);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_size_is_bounded_and_new_entries_survive_reset() {
+        let path = std::env::temp_dir().join(format!("xcreen-log-{}.tmp", std::process::id()));
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .expect("create isolated log fixture");
+        write_bounded(&mut file, b"old entry\n", 16).expect("write initial entry");
+        write_bounded(&mut file, b"latest entry\n", 16).expect("reset full log");
+        assert_eq!(std::fs::read(&path).expect("read log"), b"latest entry\n");
+        write_bounded(&mut file, &[b'x'; 32], 16).expect("bound oversized entry");
+        assert_eq!(file.metadata().expect("log metadata").len(), 16);
+        drop(file);
+        std::fs::remove_file(path).expect("remove fixture");
+    }
 
     #[test]
     fn parses_known_log_levels() {

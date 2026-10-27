@@ -1,181 +1,50 @@
-use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
-use windows::{
-    Win32::{
-        Devices::Display::{
-            DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
-            DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
-            DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME,
-            DisplayConfigGetDeviceInfo, QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
-        },
-        Foundation::{BOOL, ERROR_SUCCESS, LPARAM, RECT},
-        Graphics::Gdi::{
-            DISPLAYCONFIG_PATH_ACTIVE, EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR,
-            MONITORINFOEXW,
-        },
-        System::LibraryLoader::{GetProcAddress, LoadLibraryA},
-        UI::WindowsAndMessaging::MONITORINFOF_PRIMARY,
+use windows::Win32::{
+    Devices::Display::{
+        DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+        DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME,
+        DestroyPhysicalMonitors, DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes,
+        GetMonitorBrightness, GetMonitorContrast, GetNumberOfPhysicalMonitorsFromHMONITOR,
+        GetPhysicalMonitorsFromHMONITOR, PHYSICAL_MONITOR, QDC_ONLY_ACTIVE_PATHS,
+        QueryDisplayConfig, SetMonitorBrightness, SetMonitorContrast,
     },
-    core::s,
+    Foundation::{BOOL, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE, LPARAM, RECT},
+    Graphics::Gdi::{
+        DISPLAYCONFIG_PATH_ACTIVE, EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR,
+        MONITORINFOEXW,
+    },
+    UI::WindowsAndMessaging::MONITORINFOF_PRIMARY,
 };
 
-// DDC/CI function types
-type GetNumPhysicalMonitorsFn = unsafe extern "system" fn(HMONITOR, *mut u32) -> BOOL;
-type GetPhysicalMonitorsFn =
-    unsafe extern "system" fn(HMONITOR, u32, *mut std::ffi::c_void) -> BOOL;
-type GetMonitorBrightnessFn =
-    unsafe extern "system" fn(isize, *mut u32, *mut u32, *mut u32) -> BOOL;
-type SetMonitorBrightnessFn = unsafe extern "system" fn(isize, u32) -> BOOL;
-type GetMonitorContrastFn = unsafe extern "system" fn(isize, *mut u32, *mut u32, *mut u32) -> BOOL;
-type SetMonitorContrastFn = unsafe extern "system" fn(isize, u32) -> BOOL;
-type DestroyPhysicalMonitorFn = unsafe extern "system" fn(isize) -> BOOL;
-
-// Cached DDC/CI functions for performance
-struct DdcFunctions {
-    get_num_physical_monitors: GetNumPhysicalMonitorsFn,
-    get_physical_monitors: GetPhysicalMonitorsFn,
-    get_monitor_brightness: GetMonitorBrightnessFn,
-    set_monitor_brightness: SetMonitorBrightnessFn,
-    get_monitor_contrast: GetMonitorContrastFn,
-    set_monitor_contrast: SetMonitorContrastFn,
-    destroy_physical_monitor: DestroyPhysicalMonitorFn,
-}
-
-static DDC_FUNCTIONS: std::sync::OnceLock<Result<DdcFunctions, String>> =
-    std::sync::OnceLock::new();
-static DDC_LOCK: Mutex<()> = Mutex::new(());
-
-fn get_ddc_functions() -> Result<&'static DdcFunctions, &'static str> {
-    DDC_FUNCTIONS
-        .get_or_init(|| unsafe {
-            let dxva2_lib =
-                LoadLibraryA(s!("dxva2.dll")).map_err(|_| "DDC/CI not supported".to_string())?;
-
-            let get_num_physical_monitors =
-                GetProcAddress(dxva2_lib, s!("GetNumberOfPhysicalMonitorsFromHMONITOR"))
-                    .ok_or("Missing GetNumberOfPhysicalMonitorsFromHMONITOR".to_string())?;
-            let get_physical_monitors =
-                GetProcAddress(dxva2_lib, s!("GetPhysicalMonitorsFromHMONITOR"))
-                    .ok_or("Missing GetPhysicalMonitorsFromHMONITOR".to_string())?;
-            let get_monitor_brightness = GetProcAddress(dxva2_lib, s!("GetMonitorBrightness"))
-                .ok_or("Missing GetMonitorBrightness".to_string())?;
-            let set_monitor_brightness = GetProcAddress(dxva2_lib, s!("SetMonitorBrightness"))
-                .ok_or("Missing SetMonitorBrightness".to_string())?;
-            let get_monitor_contrast = GetProcAddress(dxva2_lib, s!("GetMonitorContrast"))
-                .ok_or("Missing GetMonitorContrast".to_string())?;
-            let set_monitor_contrast = GetProcAddress(dxva2_lib, s!("SetMonitorContrast"))
-                .ok_or("Missing SetMonitorContrast".to_string())?;
-            let destroy_physical_monitor = GetProcAddress(dxva2_lib, s!("DestroyPhysicalMonitor"))
-                .ok_or("Missing DestroyPhysicalMonitor".to_string())?;
-
-            Ok(DdcFunctions {
-                get_num_physical_monitors: std::mem::transmute::<
-                    unsafe extern "system" fn() -> isize,
-                    GetNumPhysicalMonitorsFn,
-                >(get_num_physical_monitors),
-                get_physical_monitors: std::mem::transmute::<
-                    unsafe extern "system" fn() -> isize,
-                    GetPhysicalMonitorsFn,
-                >(get_physical_monitors),
-                get_monitor_brightness: std::mem::transmute::<
-                    unsafe extern "system" fn() -> isize,
-                    GetMonitorBrightnessFn,
-                >(get_monitor_brightness),
-                set_monitor_brightness: std::mem::transmute::<
-                    unsafe extern "system" fn() -> isize,
-                    SetMonitorBrightnessFn,
-                >(set_monitor_brightness),
-                get_monitor_contrast: std::mem::transmute::<
-                    unsafe extern "system" fn() -> isize,
-                    GetMonitorContrastFn,
-                >(get_monitor_contrast),
-                set_monitor_contrast: std::mem::transmute::<
-                    unsafe extern "system" fn() -> isize,
-                    SetMonitorContrastFn,
-                >(set_monitor_contrast),
-                destroy_physical_monitor: std::mem::transmute::<
-                    unsafe extern "system" fn() -> isize,
-                    DestroyPhysicalMonitorFn,
-                >(destroy_physical_monitor),
-            })
-        })
-        .as_ref()
-        .map_err(|e| e.as_str())
-}
-
-fn with_ddc<T>(operation: impl FnOnce() -> T) -> T {
-    let _guard = DDC_LOCK.lock().unwrap();
-    operation()
-}
-
-#[repr(C)]
-struct PhysicalMonitor {
-    handle: isize,
-    description: [u16; 128],
-}
-
-struct PhysicalMonitorList {
-    monitors: Vec<PhysicalMonitor>,
-}
-
-impl PhysicalMonitorList {
-    fn iter(&self) -> impl Iterator<Item = &PhysicalMonitor> {
-        self.monitors.iter()
-    }
-
-    fn get(&self, index: usize) -> Option<&PhysicalMonitor> {
-        self.monitors.get(index)
-    }
-}
+struct PhysicalMonitorList(Vec<PHYSICAL_MONITOR>);
 
 impl Drop for PhysicalMonitorList {
     fn drop(&mut self) {
-        if let Ok(ddc) = get_ddc_functions() {
-            for monitor in &self.monitors {
-                unsafe {
-                    let _ = (ddc.destroy_physical_monitor)(monitor.handle);
-                }
-            }
+        // SAFETY: This list exclusively owns the handles returned by physical monitor
+        // enumeration. No handle escapes its lifetime.
+        unsafe {
+            let _ = DestroyPhysicalMonitors(&self.0);
         }
-    }
-}
-
-fn enumerate_physical_monitors(monitor_handle: isize) -> Result<PhysicalMonitorList, &'static str> {
-    let ddc = get_ddc_functions()?;
-    let hmonitor = HMONITOR(monitor_handle);
-
-    unsafe {
-        let mut num_monitors = 0u32;
-        if !(ddc.get_num_physical_monitors)(hmonitor, &mut num_monitors).as_bool()
-            || num_monitors == 0
-        {
-            return Err("No physical monitors found");
-        }
-
-        let mut monitors: Vec<PhysicalMonitor> = Vec::with_capacity(num_monitors as usize);
-        let ok = (ddc.get_physical_monitors)(
-            hmonitor,
-            num_monitors,
-            monitors.as_mut_ptr() as *mut std::ffi::c_void,
-        )
-        .as_bool();
-        if !ok {
-            return Err("Failed to get physical monitors");
-        }
-        monitors.set_len(num_monitors as usize);
-        Ok(PhysicalMonitorList { monitors })
     }
 }
 
 fn open_physical_monitors(monitor_handle: isize) -> Result<PhysicalMonitorList, String> {
-    enumerate_physical_monitors(monitor_handle)
-        .map_err(|err| format!("Failed to get physical monitor(s): {err}"))
+    // SAFETY: The HMONITOR comes from EnumDisplayMonitors. The count pointer and
+    // initialized array remain valid for the synchronous API calls.
+    unsafe {
+        let mut count = 0;
+        GetNumberOfPhysicalMonitorsFromHMONITOR(HMONITOR(monitor_handle), &mut count)
+            .map_err(|err| format!("Physical monitor count failed: {err}"))?;
+        let mut monitors = vec![PHYSICAL_MONITOR::default(); count as usize];
+        GetPhysicalMonitorsFromHMONITOR(HMONITOR(monitor_handle), &mut monitors)
+            .map_err(|err| format!("Physical monitor enumeration failed: {err}"))?;
+        Ok(PhysicalMonitorList(monitors))
+    }
 }
 
-/// The first DDC/CI call on a new handle often fails. Retry that call, then
-/// reopen the handle once. Further retries only delay a display with no DDC/CI.
+/// Bound transient DDC/CI retries while displays wake.
 const DDC_CALL_TRIES: u32 = 3;
 const DDC_SESSIONS: u32 = 2;
 const DDC_RETRY_GAP: Duration = Duration::from_millis(80);
@@ -190,7 +59,7 @@ fn retry_sessions<T>(
             Ok(value) => return Ok(value),
             Err(err) => {
                 last_error = err;
-                log::warn!("{action} failed ({session}/{DDC_SESSIONS}): {last_error}");
+                tracing::warn!("{action} failed ({session}/{DDC_SESSIONS}): {last_error}");
                 if session < DDC_SESSIONS {
                     thread::sleep(DDC_RETRY_GAP);
                 }
@@ -206,7 +75,7 @@ fn retry_bool(action: &str, mut call: impl FnMut() -> bool) -> bool {
             return true;
         }
         if attempt == DDC_CALL_TRIES {
-            log::warn!("{action} did not succeed");
+            tracing::warn!("{action} did not succeed");
         } else {
             thread::sleep(DDC_RETRY_GAP);
         }
@@ -214,7 +83,6 @@ fn retry_bool(action: &str, mut call: impl FnMut() -> bool) -> bool {
     false
 }
 
-#[derive(Serialize, Deserialize, Clone)]
 pub struct MonitorInfo {
     pub id: String,
     pub display_handle: isize,
@@ -222,28 +90,160 @@ pub struct MonitorInfo {
     pub physical_index: u32,
     pub name: String,
     pub is_primary: bool,
-    pub cached_brightness: Option<u32>,
-    pub cached_contrast: Option<u32>,
-    #[serde(default, skip_serializing, skip_deserializing)]
+    pub levels: Option<MonitorLevels>,
     pub level_error: Option<String>,
 }
 
-impl MonitorInfo {
-    pub fn cached_levels(&self) -> Option<MonitorLevels> {
-        match (self.cached_brightness, self.cached_contrast) {
-            (Some(brightness), Some(contrast)) => Some(MonitorLevels {
-                brightness,
-                contrast,
-            }),
-            _ => None,
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MonitorLevels {
+    pub brightness: Option<u32>,
+    pub contrast: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LevelKind {
+    Brightness,
+    Contrast,
+}
+
+impl LevelKind {
+    fn read(self, handle: HANDLE) -> Result<(u32, u32, u32), String> {
+        let (mut min, mut current, mut max) = (0, 0, 0);
+        // SAFETY: The handle belongs to a live PhysicalMonitorList and output
+        // pointers reference initialized u32 values throughout the synchronous call.
+        let success = retry_bool("Read monitor control", || unsafe {
+            (match self {
+                Self::Brightness => GetMonitorBrightness(handle, &mut min, &mut current, &mut max),
+                Self::Contrast => GetMonitorContrast(handle, &mut min, &mut current, &mut max),
+            }) != 0
+        });
+        if success && max > min {
+            Ok((min, current, max))
+        } else {
+            Err(format!("{self:?} is unavailable"))
+        }
+    }
+
+    fn write(self, handle: HANDLE, value: u32) -> Result<u32, String> {
+        let (min, current, max) = self.read(handle)?;
+        let target = min + ((u64::from(value) * u64::from(max - min) + 50) / 100) as u32;
+        // SAFETY: The handle is owned by a live PhysicalMonitorList. The target
+        // is within the range returned by this monitor for the requested control.
+        if target == current
+            // SAFETY: The live physical monitor owns this handle; target is in its reported range.
+            || retry_bool("Write monitor control", || unsafe {
+                (match self {
+                    Self::Brightness => SetMonitorBrightness(handle, target),
+                    Self::Contrast => SetMonitorContrast(handle, target),
+                }) != 0
+            })
+        {
+            Ok(percent_from_range(target, min, max))
+        } else {
+            Err(format!("Failed to set {self:?}"))
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MonitorLevels {
-    pub brightness: u32,
-    pub contrast: u32,
+fn read_levels_from_handle(handle: HANDLE) -> Result<MonitorLevels, String> {
+    let brightness = LevelKind::Brightness
+        .read(handle)
+        .ok()
+        .map(|(min, current, max)| percent_from_range(current, min, max));
+    let contrast = LevelKind::Contrast
+        .read(handle)
+        .ok()
+        .map(|(min, current, max)| percent_from_range(current, min, max));
+    if brightness.is_none() && contrast.is_none() {
+        Err("DDC/CI brightness and contrast are unavailable".into())
+    } else {
+        Ok(MonitorLevels {
+            brightness,
+            contrast,
+        })
+    }
+}
+
+fn validate_display(monitor: &MonitorInfo) -> Result<(), String> {
+    let mut info = MONITORINFOEXW::default();
+    info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+    // SAFETY: info has the API-required size and a live writable buffer. Windows
+    // rejects an HMONITOR that became invalid after a display configuration change.
+    if unsafe { GetMonitorInfoW(HMONITOR(monitor.display_handle), &mut info.monitorInfo).as_bool() }
+        && wide_to_string(&info.szDevice).eq_ignore_ascii_case(&monitor.display_device)
+    {
+        Ok(())
+    } else {
+        Err("The selected display is no longer connected; refresh monitors".into())
+    }
+}
+
+pub fn read_monitor_levels(monitor: &MonitorInfo) -> Result<MonitorLevels, String> {
+    validate_display(monitor)?;
+    retry_sessions("Read monitor controls", || {
+        let physical = open_physical_monitors(monitor.display_handle)?;
+        let pm = physical
+            .0
+            .get(monitor.physical_index as usize)
+            .ok_or_else(|| "Physical monitor is no longer connected".to_string())?;
+        read_levels_from_handle(pm.hPhysicalMonitor)
+    })
+}
+
+/// Updates only requested channels. Successful channels remain cached if another fails.
+pub fn apply_levels(monitor: &mut MonitorInfo, requested: MonitorLevels) -> Result<(), String> {
+    if requested.brightness.is_some_and(|v| v > 100) || requested.contrast.is_some_and(|v| v > 100)
+    {
+        return Err("Values must be between 0 and 100".into());
+    }
+    validate_display(monitor)?;
+    let physical = retry_sessions("Open monitor controls", || {
+        open_physical_monitors(monitor.display_handle)
+    })?;
+    let pm = physical
+        .0
+        .get(monitor.physical_index as usize)
+        .ok_or_else(|| "Physical monitor is no longer connected".to_string())?;
+    let levels = monitor.levels.get_or_insert_with(MonitorLevels::default);
+    apply_requested(levels, requested, |kind, value| {
+        kind.write(pm.hPhysicalMonitor, value)
+    })
+}
+
+fn apply_requested(
+    levels: &mut MonitorLevels,
+    requested: MonitorLevels,
+    mut write: impl FnMut(LevelKind, u32) -> Result<u32, String>,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for (kind, value, cached) in [
+        (
+            LevelKind::Brightness,
+            requested.brightness,
+            &mut levels.brightness,
+        ),
+        (
+            LevelKind::Contrast,
+            requested.contrast,
+            &mut levels.contrast,
+        ),
+    ] {
+        let Some(value) = value else {
+            continue;
+        };
+        match write(kind, value) {
+            Ok(actual) => *cached = Some(actual),
+            Err(err) => {
+                *cached = None;
+                errors.push(err);
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 fn wide_to_string(data: &[u16]) -> String {
@@ -292,76 +292,19 @@ fn percent_from_range(value: u32, min: u32, max: u32) -> u32 {
     ((offset * 100 + span / 2) / span).min(100) as u32
 }
 
-fn read_levels_from_handle(ddc: &DdcFunctions, handle: isize) -> Result<MonitorLevels, String> {
-    unsafe {
-        let mut min_b = 0;
-        let mut cur_b = 0;
-        let mut max_b = 0;
-        if !retry_bool("Read brightness", || {
-            (ddc.get_monitor_brightness)(handle, &mut min_b, &mut cur_b, &mut max_b).as_bool()
-        }) {
-            return Err("Brightness is not supported by this monitor".to_string());
-        }
-
-        let mut min_c = 0;
-        let mut cur_c = 0;
-        let mut max_c = 0;
-        if !retry_bool("Read contrast", || {
-            (ddc.get_monitor_contrast)(handle, &mut min_c, &mut cur_c, &mut max_c).as_bool()
-        }) {
-            return Err("Contrast is not supported by this monitor".to_string());
-        }
-
-        Ok(MonitorLevels {
-            brightness: percent_from_range(cur_b, min_b, max_b),
-            contrast: percent_from_range(cur_c, min_c, max_c),
-        })
-    }
-}
-
-fn read_physical_monitors_once(
-    monitor_handle: isize,
-) -> Result<Vec<(String, MonitorLevels)>, String> {
-    let ddc = get_ddc_functions().map_err(|err| format!("DDC/CI error: {err}"))?;
-    let physical = open_physical_monitors(monitor_handle)?;
-    let mut values = Vec::new();
-    let mut last_error = None;
-    for monitor in physical.iter() {
-        let description = wide_to_string(&monitor.description);
-        match read_levels_from_handle(ddc, monitor.handle) {
-            Ok(levels) => values.push((description, levels)),
-            Err(err) => last_error = Some(err),
-        }
-    }
-    if values.is_empty() {
-        return Err(last_error.unwrap_or_else(|| "No physical monitors found".to_string()));
-    }
-    Ok(values)
-}
-
-fn read_physical_monitors(monitor_handle: isize) -> Result<Vec<(String, MonitorLevels)>, String> {
-    retry_sessions("Monitor control read", || {
-        read_physical_monitors_once(monitor_handle)
-    })
-}
-
 struct GdiDisplay {
     handle: isize,
     device: String,
     is_primary: bool,
 }
 
-#[derive(Clone)]
 struct DisplayIdentity {
     gdi_device: String,
     friendly_name: String,
     device_path: String,
-    edid_manufacturer: u16,
-    edid_product: u16,
-    connector_instance: u32,
 }
 
-fn enumerate_gdi_displays() -> Vec<GdiDisplay> {
+fn enumerate_gdi_displays() -> Result<Vec<GdiDisplay>, String> {
     let mut displays = Vec::new();
 
     unsafe extern "system" fn enum_monitor_proc(
@@ -370,12 +313,14 @@ fn enumerate_gdi_displays() -> Vec<GdiDisplay> {
         _rect: *mut RECT,
         lparam: LPARAM,
     ) -> BOOL {
+        // SAFETY: Enumeration is synchronous and receives the Vec pointer supplied below.
         let displays = unsafe { &mut *(lparam.0 as *mut Vec<GdiDisplay>) };
         let mut info = MONITORINFOEXW {
             monitorInfo: Default::default(),
             szDevice: [0; 32],
         };
         info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        // SAFETY: info has the required size and the callback supplies an HMONITOR.
         if unsafe { GetMonitorInfoW(hmonitor, &mut info.monitorInfo as *mut _ as *mut _).as_bool() }
         {
             displays.push(GdiDisplay {
@@ -387,69 +332,66 @@ fn enumerate_gdi_displays() -> Vec<GdiDisplay> {
         BOOL::from(true)
     }
 
+    // SAFETY: displays lives until synchronous enumeration completes.
     unsafe {
-        let _ = EnumDisplayMonitors(
+        EnumDisplayMonitors(
             HDC::default(),
             None,
             Some(enum_monitor_proc),
             LPARAM(&mut displays as *mut _ as isize),
-        );
+        )
+        .ok()
+        .map_err(|err| format!("Display enumeration failed: {err}"))?;
     }
-    displays
+    Ok(displays)
 }
 
 fn query_display_identities() -> Vec<DisplayIdentity> {
     match query_display_identities_inner() {
         Ok(identities) => identities,
         Err(err) => {
-            log::warn!("Display configuration query failed; monitor names may be generic: {err}");
+            tracing::warn!(
+                "Display configuration query failed; monitor names may be generic: {err}"
+            );
             Vec::new()
         }
     }
 }
 
 fn query_display_identities_inner() -> Result<Vec<DisplayIdentity>, String> {
+    // SAFETY: Buffers have the initialized sizes reported by Windows, and each
+    // device-info request below supplies its required header size and path IDs.
     unsafe {
-        let mut path_count = 0u32;
-        let mut mode_count = 0u32;
-        let _ = QueryDisplayConfig(
-            QDC_ONLY_ACTIVE_PATHS,
-            &mut path_count,
-            std::ptr::null_mut(),
-            &mut mode_count,
-            std::ptr::null_mut(),
-            None,
-        );
-        if path_count == 0 {
-            return Ok(Vec::new());
+        let mut paths = Vec::new();
+        for attempt in 0..3 {
+            let (mut path_count, mut mode_count) = (0, 0);
+            let status = GetDisplayConfigBufferSizes(
+                QDC_ONLY_ACTIVE_PATHS,
+                &mut path_count,
+                &mut mode_count,
+            );
+            if status != ERROR_SUCCESS {
+                return Err(format!("Display buffer sizing failed ({})", status.0));
+            }
+            paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+            let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+            let status = QueryDisplayConfig(
+                QDC_ONLY_ACTIVE_PATHS,
+                &mut path_count,
+                paths.as_mut_ptr(),
+                &mut mode_count,
+                modes.as_mut_ptr(),
+                None,
+            );
+            if status == ERROR_INSUFFICIENT_BUFFER && attempt < 2 {
+                continue;
+            }
+            if status != ERROR_SUCCESS {
+                return Err(format!("Display configuration query failed ({})", status.0));
+            }
+            paths.truncate(path_count as usize);
+            break;
         }
-
-        let mut paths = Vec::with_capacity(path_count as usize);
-        for _ in 0..path_count {
-            paths.push(std::mem::zeroed::<DISPLAYCONFIG_PATH_INFO>());
-        }
-        let mut modes = Vec::with_capacity(mode_count as usize);
-        for _ in 0..mode_count {
-            modes.push(std::mem::zeroed::<DISPLAYCONFIG_MODE_INFO>());
-        }
-
-        let mode_ptr = if modes.is_empty() {
-            std::ptr::null_mut()
-        } else {
-            modes.as_mut_ptr()
-        };
-        let status = QueryDisplayConfig(
-            QDC_ONLY_ACTIVE_PATHS,
-            &mut path_count,
-            paths.as_mut_ptr(),
-            &mut mode_count,
-            mode_ptr,
-            None,
-        );
-        if status != ERROR_SUCCESS {
-            return Err(format!("QueryDisplayConfig failed ({})", status.0));
-        }
-        paths.truncate(path_count as usize);
 
         let mut identities = Vec::new();
         for path in paths {
@@ -483,9 +425,6 @@ fn query_display_identities_inner() -> Result<Vec<DisplayIdentity>, String> {
                 gdi_device: wide_to_string(&source.viewGdiDeviceName),
                 friendly_name: wide_to_string(&target.monitorFriendlyDeviceName),
                 device_path: wide_to_string(&target.monitorDevicePath),
-                edid_manufacturer: target.edidManufactureId,
-                edid_product: target.edidProductCodeId,
-                connector_instance: target.connectorInstance,
             });
         }
         Ok(identities)
@@ -496,316 +435,206 @@ fn best_identity<'a>(
     identities: &'a [DisplayIdentity],
     gdi_device: &str,
 ) -> Option<&'a DisplayIdentity> {
-    identities
+    let mut matching = identities
         .iter()
-        .filter(|identity| identity.gdi_device.eq_ignore_ascii_case(gdi_device))
-        .min_by_key(|identity| is_placeholder_name(&identity.friendly_name))
+        .filter(|identity| identity.gdi_device.eq_ignore_ascii_case(gdi_device));
+    let identity = matching.next()?;
+    // Clone-mode targets share a GDI source; its physical-monitor order is not
+    // specified to match the display configuration path order.
+    if matching.next().is_some() {
+        None
+    } else {
+        Some(identity)
+    }
 }
 
 fn monitor_id(identity: Option<&DisplayIdentity>, gdi_device: &str, physical_index: u32) -> String {
-    if let Some(identity) = identity {
-        if !identity.device_path.trim().is_empty() {
-            return indexed_id(identity.device_path.trim(), physical_index);
-        }
-        if identity.edid_manufacturer != 0 || identity.edid_product != 0 {
-            return indexed_id(
-                &format!(
-                    "edid:{:04X}:{:04X}:{}",
-                    identity.edid_manufacturer, identity.edid_product, identity.connector_instance
-                ),
-                physical_index,
-            );
-        }
+    if let Some(identity) = identity
+        && !identity.device_path.trim().is_empty()
+    {
+        return indexed_id(identity.device_path.trim(), physical_index);
     }
     indexed_id(&format!("gdi:{gdi_device}"), physical_index)
 }
 
-fn remember_previous(
-    previous: &[MonitorInfo],
-    id: &str,
-    name: &mut String,
-    cached_brightness: &mut Option<u32>,
-    cached_contrast: &mut Option<u32>,
-    level_error: &mut Option<String>,
-) {
-    let Some(prior) = previous.iter().find(|monitor| monitor.id == id) else {
-        return;
-    };
-    if is_placeholder_name(name) && !is_placeholder_name(&prior.name) {
-        *name = prior.name.clone();
-    }
-    if cached_brightness.is_none() || cached_contrast.is_none() {
-        if let (Some(brightness), Some(contrast)) = (prior.cached_brightness, prior.cached_contrast)
-        {
-            *cached_brightness = Some(brightness);
-            *cached_contrast = Some(contrast);
-            *level_error = None;
-        }
-    }
-}
-
-fn dedupe_monitors(monitors: Vec<MonitorInfo>) -> Vec<MonitorInfo> {
-    let mut unique: Vec<MonitorInfo> = Vec::new();
-    for monitor in monitors {
-        if let Some(existing) = unique.iter_mut().find(|existing| existing.id == monitor.id) {
-            if is_placeholder_name(&existing.name) && !is_placeholder_name(&monitor.name) {
-                existing.name = monitor.name.clone();
-            }
-            if monitor.cached_levels().is_some() && existing.cached_levels().is_none() {
-                let name = existing.name.clone();
-                *existing = monitor;
-                existing.name = name;
-            }
-        } else {
-            unique.push(monitor);
-        }
-    }
-    unique
-}
-
-fn describe_monitor(
-    previous: &[MonitorInfo],
-    display: &GdiDisplay,
-    identity: Option<&DisplayIdentity>,
-    physical_index: u32,
-    description: &str,
-    levels: Option<MonitorLevels>,
-    mut level_error: Option<String>,
-) -> MonitorInfo {
-    let edid_name = identity
-        .map(|item| item.friendly_name.as_str())
-        .unwrap_or("");
-    let id = monitor_id(identity, &display.device, physical_index);
-    let mut name = monitor_name(description, edid_name, &display.device);
-    let mut cached_brightness = levels.map(|levels| levels.brightness);
-    let mut cached_contrast = levels.map(|levels| levels.contrast);
-    remember_previous(
-        previous,
-        &id,
-        &mut name,
-        &mut cached_brightness,
-        &mut cached_contrast,
-        &mut level_error,
-    );
-    MonitorInfo {
-        id,
-        display_handle: display.handle,
-        display_device: display.device.clone(),
-        physical_index,
-        name,
-        is_primary: display.is_primary,
-        cached_brightness,
-        cached_contrast,
-        level_error,
-    }
-}
-
-fn build_monitor_list(previous: &[MonitorInfo]) -> Vec<MonitorInfo> {
-    let displays = enumerate_gdi_displays();
+pub fn get_monitor_list_sync() -> Result<Vec<MonitorInfo>, String> {
     let identities = query_display_identities();
     let mut monitors = Vec::new();
-
-    for display in displays {
+    for display in enumerate_gdi_displays()? {
         let identity = best_identity(&identities, &display.device);
-        match read_physical_monitors(display.handle) {
-            Ok(physical) => {
-                for (physical_index, (description, levels)) in physical.into_iter().enumerate() {
-                    monitors.push(describe_monitor(
-                        previous,
-                        &display,
-                        identity,
-                        physical_index as u32,
-                        &description,
-                        Some(levels),
-                        None,
-                    ));
-                }
-            }
+        let physical = match retry_sessions("Discover physical monitors", || {
+            open_physical_monitors(display.handle)
+        }) {
+            Ok(physical) => physical,
             Err(err) => {
-                log::warn!("Couldn't read controls for {}: {err}", display.device);
-                monitors.push(describe_monitor(
-                    previous,
-                    &display,
-                    identity,
-                    0,
-                    "",
-                    None,
-                    Some(err),
-                ));
+                monitors.push(MonitorInfo {
+                    id: monitor_id(identity, &display.device, 0),
+                    display_handle: display.handle,
+                    display_device: display.device.clone(),
+                    physical_index: 0,
+                    name: monitor_name(
+                        "",
+                        identity
+                            .map(|item| item.friendly_name.as_str())
+                            .unwrap_or(""),
+                        &display.device,
+                    ),
+                    is_primary: display.is_primary,
+                    levels: None,
+                    level_error: Some(err),
+                });
+                continue;
             }
-        }
+        };
+        monitors.extend(describe_physical_monitors(
+            &display,
+            identity,
+            &physical.0,
+            read_levels_from_handle,
+        ));
     }
-
-    dedupe_monitors(monitors)
+    monitors.sort_by_key(|monitor| !monitor.is_primary);
+    Ok(monitors)
 }
 
-pub fn get_monitor_list_sync(previous: &[MonitorInfo]) -> Result<Vec<MonitorInfo>, String> {
-    Ok(with_ddc(|| build_monitor_list(previous)))
-}
-
-/// Read brightness and contrast without borrowing a [`MonitorInfo`].
-/// Callers must not hold the monitor list lock: this takes the DDC lock.
-pub fn read_monitor_levels(
-    display_handle: isize,
-    physical_index: u32,
-) -> Result<MonitorLevels, String> {
-    with_ddc(|| {
-        let physical = read_physical_monitors(display_handle)?;
-        physical
-            .get(physical_index as usize)
-            .map(|(_, levels)| *levels)
-            .ok_or_else(|| format!("Physical monitor index {physical_index} no longer exists"))
-    })
-}
-
-/// Write brightness and contrast. Unchanged cached channels are not sent to the monitor.
-pub fn apply_cached_levels(
-    display_handle: isize,
-    physical_index: u32,
-    brightness: u32,
-    contrast: u32,
-    cached_brightness: Option<u32>,
-    cached_contrast: Option<u32>,
-) -> Result<MonitorLevels, String> {
-    if brightness > 100 || contrast > 100 {
-        return Err("Values must be between 0 and 100".to_string());
-    }
-    let brightness_changed = cached_brightness != Some(brightness);
-    let contrast_changed = cached_contrast != Some(contrast);
-    if !brightness_changed && !contrast_changed {
-        return Ok(MonitorLevels {
-            brightness,
-            contrast,
+fn describe_physical_monitors(
+    display: &GdiDisplay,
+    identity: Option<&DisplayIdentity>,
+    physical: &[PHYSICAL_MONITOR],
+    mut read_levels: impl FnMut(HANDLE) -> Result<MonitorLevels, String>,
+) -> Vec<MonitorInfo> {
+    let mut monitors = Vec::with_capacity(physical.len());
+    for (index, pm) in physical.iter().enumerate() {
+        let description = pm.szPhysicalMonitorDescription;
+        let (levels, level_error) = match read_levels(pm.hPhysicalMonitor) {
+            Ok(levels) => (Some(levels), None),
+            Err(err) => (None, Some(err)),
+        };
+        monitors.push(MonitorInfo {
+            id: monitor_id(identity, &display.device, index as u32),
+            display_handle: display.handle,
+            display_device: display.device.clone(),
+            physical_index: index as u32,
+            name: monitor_name(
+                &wide_to_string(&description),
+                identity
+                    .map(|item| item.friendly_name.as_str())
+                    .unwrap_or(""),
+                &display.device,
+            ),
+            is_primary: display.is_primary,
+            levels,
+            level_error,
         });
     }
-    let apply = with_ddc(|| {
-        set_monitor_settings_sync_internal(
-            display_handle,
-            physical_index,
-            brightness,
-            contrast,
-            brightness_changed,
-            contrast_changed,
-        )
-    })?;
-    Ok(MonitorLevels {
-        brightness: if apply.brightness_succeeded || !brightness_changed {
-            brightness
-        } else {
-            cached_brightness.unwrap_or(brightness)
-        },
-        contrast: if apply.contrast_succeeded || !contrast_changed {
-            contrast
-        } else {
-            cached_contrast.unwrap_or(contrast)
-        },
-    })
-}
-
-struct ApplyResult {
-    brightness_succeeded: bool,
-    contrast_succeeded: bool,
-}
-
-fn set_monitor_settings_sync_internal(
-    monitor_handle: isize,
-    physical_index: u32,
-    brightness: u32,
-    contrast: u32,
-    apply_brightness: bool,
-    apply_contrast: bool,
-) -> Result<ApplyResult, String> {
-    let ddc = get_ddc_functions().map_err(|err| format!("DDC/CI error: {err}"))?;
-    let physical_monitors = retry_sessions("Open physical monitors", || {
-        open_physical_monitors(monitor_handle)
-    })?;
-
-    let mut any_success = false;
-    let mut brightness_success = false;
-    let mut contrast_success = false;
-    let mut last_error: Option<String> = None;
-
-    let scale_to_range = |value: u32, min_v: u32, max_v: u32| -> u32 {
-        if max_v <= min_v {
-            return min_v;
-        }
-        let span = u64::from(max_v - min_v);
-        let scaled = (u64::from(value) * span + 50) / 100;
-        min_v + scaled as u32
-    };
-
-    let Some(pm) = physical_monitors.get(physical_index as usize) else {
-        return Err(format!(
-            "Physical monitor index {physical_index} no longer exists"
-        ));
-    };
-    let handle = pm.handle;
-
-    if apply_brightness {
-        let mut min_b = 0u32;
-        let mut cur_b = 0u32;
-        let mut max_b = 0u32;
-        if retry_bool("Read brightness before write", || unsafe {
-            (ddc.get_monitor_brightness)(handle, &mut min_b, &mut cur_b, &mut max_b).as_bool()
-        }) {
-            let target_b = scale_to_range(brightness, min_b, max_b);
-            if target_b != cur_b {
-                if retry_bool("Set brightness", || unsafe {
-                    (ddc.set_monitor_brightness)(handle, target_b).as_bool()
-                }) {
-                    any_success = true;
-                    brightness_success = true;
-                } else {
-                    last_error = Some("Failed to set brightness".to_string());
-                }
-            } else {
-                any_success = true;
-                brightness_success = true;
-            }
-        } else {
-            last_error = Some("Brightness not supported".to_string());
-        }
-    }
-
-    if apply_contrast {
-        let mut min_c = 0u32;
-        let mut cur_c = 0u32;
-        let mut max_c = 0u32;
-        if retry_bool("Read contrast before write", || unsafe {
-            (ddc.get_monitor_contrast)(handle, &mut min_c, &mut cur_c, &mut max_c).as_bool()
-        }) {
-            let target_c = scale_to_range(contrast, min_c, max_c);
-            if target_c != cur_c {
-                if retry_bool("Set contrast", || unsafe {
-                    (ddc.set_monitor_contrast)(handle, target_c).as_bool()
-                }) {
-                    any_success = true;
-                    contrast_success = true;
-                } else {
-                    last_error = Some("Failed to set contrast".to_string());
-                }
-            } else {
-                any_success = true;
-                contrast_success = true;
-            }
-        } else {
-            last_error = Some("Contrast not supported".to_string());
-        }
-    }
-
-    if any_success || (!apply_brightness && !apply_contrast) {
-        Ok(ApplyResult {
-            brightness_succeeded: brightness_success,
-            contrast_succeeded: contrast_success,
-        })
-    } else {
-        Err(last_error.unwrap_or_else(|| "DDC/CI operation failed".to_string()))
-    }
+    monitors
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_write_reports_failure_without_fabricating_a_successful_value() {
+        let mut levels = MonitorLevels {
+            brightness: Some(40),
+            contrast: Some(50),
+        };
+        let requested = MonitorLevels {
+            brightness: Some(75),
+            contrast: Some(60),
+        };
+        let result = apply_requested(&mut levels, requested, |kind, _| match kind {
+            LevelKind::Brightness => Ok(74),
+            LevelKind::Contrast => Err("Disconnected during contrast write".into()),
+        });
+        assert_eq!(result, Err("Disconnected during contrast write".into()));
+        assert_eq!(levels.brightness, Some(74));
+        assert_eq!(levels.contrast, None);
+    }
+
+    #[test]
+    fn changing_brightness_never_writes_contrast() {
+        let mut levels = MonitorLevels {
+            brightness: Some(40),
+            contrast: None,
+        };
+        let mut written = Vec::new();
+        apply_requested(
+            &mut levels,
+            MonitorLevels {
+                brightness: Some(75),
+                contrast: None,
+            },
+            |kind, value| {
+                written.push(kind);
+                Ok(value)
+            },
+        )
+        .expect("brightness write succeeds without contrast support");
+        assert_eq!(written, [LevelKind::Brightness]);
+        assert_eq!(levels.contrast, None);
+    }
+
+    #[test]
+    fn failed_probe_keeps_later_physical_indices_and_brightness_only_support() {
+        let display = GdiDisplay {
+            handle: 0,
+            device: "DISPLAY1".into(),
+            is_primary: true,
+        };
+        let physical = [
+            PHYSICAL_MONITOR {
+                hPhysicalMonitor: HANDLE(1),
+                ..Default::default()
+            },
+            PHYSICAL_MONITOR {
+                hPhysicalMonitor: HANDLE(2),
+                ..Default::default()
+            },
+        ];
+        let monitors = describe_physical_monitors(&display, None, &physical, |handle| {
+            if handle == HANDLE(1) {
+                Err("Display is waking".into())
+            } else {
+                Ok(MonitorLevels {
+                    brightness: Some(42),
+                    contrast: None,
+                })
+            }
+        });
+        assert_eq!(monitors.len(), 2);
+        assert_eq!(monitors[0].physical_index, 0);
+        assert!(monitors[0].level_error.is_some());
+        assert_eq!(monitors[1].physical_index, 1);
+        assert_eq!(
+            monitors[1].levels,
+            Some(MonitorLevels {
+                brightness: Some(42),
+                contrast: None
+            })
+        );
+        assert_ne!(monitors[0].id, monitors[1].id);
+    }
+
+    #[test]
+    fn cloned_targets_do_not_borrow_each_others_identity() {
+        let identities = [
+            DisplayIdentity {
+                gdi_device: "DISPLAY1".into(),
+                friendly_name: "Dell".into(),
+                device_path: "dell-path".into(),
+            },
+            DisplayIdentity {
+                gdi_device: "DISPLAY1".into(),
+                friendly_name: "LG".into(),
+                device_path: "lg-path".into(),
+            },
+        ];
+        assert!(best_identity(&identities, "display1").is_none());
+        assert!(best_identity(&identities[..1], "display1").is_some());
+        assert!(best_identity(&identities, "DISPLAY2").is_none());
+    }
 
     #[test]
     fn monitor_name_prefers_model_over_generic_probe() {
@@ -826,9 +655,6 @@ mod tests {
             gdi_device: r"\\.\DISPLAY1".into(),
             friendly_name: "Generic PnP Monitor".into(),
             device_path: path.into(),
-            edid_manufacturer: 0x10AC,
-            edid_product: 0x40C2,
-            connector_instance: 1,
         };
         assert_eq!(monitor_id(Some(&identity), r"\\.\DISPLAY2", 0), path);
         assert_eq!(
@@ -836,12 +662,6 @@ mod tests {
             format!("{path}#1")
         );
 
-        let mut without_path = identity.clone();
-        without_path.device_path.clear();
-        assert_eq!(
-            monitor_id(Some(&without_path), r"\\.\DISPLAY2", 0),
-            "edid:10AC:40C2:1"
-        );
         assert_eq!(monitor_id(None, r"\\.\DISPLAY2", 0), r"gdi:\\.\DISPLAY2");
     }
 

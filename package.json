@@ -1,0 +1,8 @@
+{
+  "name": "xcreen",
+  "private": true,
+  "scripts": {
+    "fmt": "cargo fmt",
+    "verify": "cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test"
+  }
+}
