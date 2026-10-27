@@ -39,14 +39,33 @@ While the app features a fully native in-app settings menu, all preferences are 
 ```json
 {
   "autostart_enabled": false,
-  "last_brightness": 50,
-  "monitors": [
-    {
-      "id": "display-specific-id",
-      "display_device": "\\\\.\\DISPLAY1",
-      "physical_index": 0,
-      "name": "External Monitor"
-    }
-  ],
   "log_level": "warn"
 }
+```
+
+Monitor discovery runs in the background at startup and after display changes or resume.
+Opening the flyout reads the selected monitor; **Refresh Monitors** rescans all displays.
+Brightness and contrast are enabled independently according to monitor support. DDC/CI
+must be enabled in the monitor's own settings. Internal laptop panels usually do not
+support DDC/CI.
+
+Legacy monitor lists, `last_brightness`, and brightness profiles are ignored. Monitor
+settings are read from the hardware rather than restored from the configuration file.
+Configuration writes replace the file atomically. `XCreen.log`, next to the executable,
+is capped at 1 MiB; it resets when the next entry would exceed that limit.
+
+## Development
+
+Build on Windows with Rust 1.95 or newer, the MSVC build tools, and the Windows SDK.
+Install Rust's `rustfmt` and `clippy` components. Bun runs the repository tasks without
+any JavaScript dependencies:
+
+```powershell
+bun fmt
+bun verify
+cargo build --release
+```
+
+Verification covers formatting, Clippy, and regression tests. Hardware checks should
+also cover startup with sleeping monitors, hot-plugging, resume, brightness-only
+monitors, and flyout placement on displays with different DPI and negative coordinates.

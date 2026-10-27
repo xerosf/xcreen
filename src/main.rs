@@ -3,55 +3,60 @@
 mod modules;
 
 use ::image::ImageFormat;
-use log::{error, info};
 use modules::config::AppConfig;
-use modules::monitor::{MonitorInfo, MonitorLevels};
+use modules::monitor::{LevelKind, MonitorInfo, MonitorLevels};
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tracing::{error, info, warn};
 use tray_icon::{
     Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
     menu::{Menu, MenuItem, PredefinedMenuItem},
 };
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWINDOWATTRIBUTE, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
 };
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE, VK_LBUTTON};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
+use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumThreadWindows, GWL_EXSTYLE, GWL_STYLE, GetForegroundWindow, GetWindowLongW, GetWindowRect,
-    GetWindowThreadProcessId, HWND_TOPMOST, IsWindowVisible, PostMessageW, SW_HIDE, SW_SHOW,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow, SetWindowLongW,
-    SetWindowPos, ShowWindow, WM_CANCELMODE, WS_CAPTION, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
-    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
+    EnumThreadWindows, GA_ROOTOWNER, GWL_EXSTYLE, GWL_STYLE, GetAncestor, GetForegroundWindow,
+    GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, HWND_TOPMOST, IsWindowVisible,
+    KillTimer, PostMessageW, SW_HIDE, SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SetForegroundWindow, SetTimer, SetWindowLongW, SetWindowPos, ShowWindow, WM_APP,
+    WM_CANCELMODE, WM_DISPLAYCHANGE, WM_POWERBROADCAST, WM_TIMER, WS_CAPTION, WS_EX_APPWINDOW,
+    WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
 };
-use windows_reactor::*;
+use windows_reactor::{
+    App, AsyncSetState, Backdrop, ComboBox, Component, Element, ElementExt, GridLength,
+    HorizontalAlignment, InfoBar, InfoBarSeverity, InnerConstraints, ProgressRing, ReactorHost,
+    RenderCx, Slider, Thickness, ToggleSwitch, VerticalAlignment, WindowSize, body, body_strong,
+    border, button, caption, grid, hstack, subtitle, vstack,
+};
 use winreg::RegKey;
-use winreg::enums::*;
+use winreg::enums::{HKEY_CURRENT_USER, KEY_SET_VALUE};
 
 const FLYOUT_WIDTH_DIP: f64 = 360.0;
 const FLYOUT_HEIGHT_DIP: f64 = 280.0;
+/// The click that opens the flyout also moves foreground. Hiding on that
+/// focus change would close the window before it is visible.
+const FLYOUT_DISMISS_GRACE: Duration = Duration::from_millis(400);
+const WM_SHOW_FLYOUT: u32 = WM_APP + 1;
+const WM_HIDE_FLYOUT: u32 = WM_APP + 2;
+const DISMISS_TIMER: usize = 0x5843_0001;
+const DISCOVERY_TIMER: usize = 0x5843_0002;
+const PBT_APMRESUMEAUTOMATIC: usize = 0x12;
 
-#[derive(Clone)]
-struct AppState {
-    monitors: Arc<Mutex<Vec<MonitorInfo>>>,
-    config: Arc<Mutex<AppConfig>>,
-    ambient_light_available: Arc<Mutex<bool>>,
-}
-
-impl AppState {
-    fn new(config: AppConfig, ambient_light_available: bool) -> Self {
-        Self {
-            monitors: Arc::new(Mutex::new(Vec::new())),
-            config: Arc::new(Mutex::new(config)),
-            ambient_light_available: Arc::new(Mutex::new(ambient_light_available)),
-        }
-    }
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,12 +70,14 @@ struct UiMonitor {
     id: String,
     name: String,
     is_primary: bool,
+    ready: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct UiSnapshot {
     monitors: Vec<UiMonitor>,
     selected: usize,
+    selection_explicit: bool,
     levels: Option<MonitorLevels>,
     loading: bool,
     refreshing: bool,
@@ -87,6 +94,7 @@ impl UiSnapshot {
         Self {
             monitors: Vec::new(),
             selected: 0,
+            selection_explicit: false,
             levels: None,
             loading: false,
             refreshing: false,
@@ -104,342 +112,486 @@ impl UiSnapshot {
     }
 }
 
-static UI_SNAPSHOT: OnceLock<Arc<Mutex<UiSnapshot>>> = OnceLock::new();
-static UI_SETTER: OnceLock<Mutex<Option<AsyncSetState<UiSnapshot>>>> = OnceLock::new();
-static APP_STATE: OnceLock<AppState> = OnceLock::new();
+static UI_SNAPSHOT: OnceLock<Mutex<UiSnapshot>> = OnceLock::new();
+static UI_SETTER: OnceLock<AsyncSetState<UiSnapshot>> = OnceLock::new();
+static CONFIG: OnceLock<Mutex<AppConfig>> = OnceLock::new();
 static FLYOUT_HWND: AtomicIsize = AtomicIsize::new(0);
-static LOAD_GENERATION: AtomicU64 = AtomicU64::new(0);
-static PENDING_COMMIT: Mutex<Option<(String, LevelKind, u32)>> = Mutex::new(None);
+static SHOWN_AT: Mutex<Option<Instant>> = Mutex::new(None);
 
 thread_local! {
-    static RUNTIME: RefCell<Option<(ReactorHost, Option<TrayIcon>)>> = const { RefCell::new(None) };
+    static RUNTIME: RefCell<Option<(ReactorHost, TrayIcon)>> = const { RefCell::new(None) };
 }
 
-fn shared_snapshot() -> &'static Arc<Mutex<UiSnapshot>> {
-    UI_SNAPSHOT.get().expect("UI snapshot is initialized")
+fn shared_snapshot() -> &'static Mutex<UiSnapshot> {
+    UI_SNAPSHOT
+        .get()
+        .expect("invariant: UI snapshot is initialized before callbacks")
+}
+
+fn shared_config() -> &'static Mutex<AppConfig> {
+    CONFIG
+        .get()
+        .expect("invariant: config is initialized before callbacks")
 }
 
 fn publish_snapshot() {
-    let snapshot = shared_snapshot().lock().unwrap().clone();
-    if let Some(setter) = UI_SETTER.get().and_then(|slot| slot.lock().ok()?.clone()) {
-        setter.call(snapshot);
+    let snapshot = lock(shared_snapshot());
+    if let Some(setter) = UI_SETTER.get() {
+        setter.call(snapshot.clone());
     }
 }
 
-fn refresh_snapshot_from_state(preserve_id: Option<&str>) {
-    let state = APP_STATE.get().expect("app state is initialized");
-    let monitors = state.monitors.lock().unwrap();
-    let mut ui_monitors: Vec<UiMonitor> = monitors
+fn choose_selected_index(
+    monitors: &[UiMonitor],
+    preserve_id: Option<&str>,
+    explicit: bool,
+) -> usize {
+    let previous = preserve_id.and_then(|id| monitors.iter().position(|monitor| monitor.id == id));
+    previous
+        .filter(|&index| explicit || monitors[index].ready)
+        .or_else(|| {
+            monitors
+                .iter()
+                .position(|monitor| monitor.is_primary && monitor.ready)
+        })
+        .or_else(|| monitors.iter().position(|monitor| monitor.ready))
+        .or(previous)
+        .unwrap_or(0)
+}
+
+#[derive(Debug)]
+enum MonitorCommand {
+    Refresh,
+    Read {
+        id: String,
+        generation: u64,
+    },
+    Apply {
+        id: String,
+        levels: MonitorLevels,
+        generation: u64,
+    },
+    Ambient {
+        id: String,
+        generation: u64,
+    },
+}
+
+#[derive(Default)]
+struct MonitorQueue {
+    commands: Mutex<VecDeque<(MonitorCommand, Instant)>>,
+    wake: Condvar,
+}
+
+impl MonitorQueue {
+    fn retry_discovery(&self) {
+        let mut commands = lock(&self.commands);
+        if !commands
+            .iter()
+            .any(|(cmd, _)| matches!(cmd, MonitorCommand::Refresh))
+        {
+            commands.push_back((
+                MonitorCommand::Refresh,
+                Instant::now() + Duration::from_secs(1),
+            ));
+            self.wake.notify_one();
+        }
+    }
+
+    fn send(&self, command: MonitorCommand) {
+        let mut commands = lock(&self.commands);
+        match &command {
+            MonitorCommand::Refresh => {
+                commands.retain(|(cmd, _)| !matches!(cmd, MonitorCommand::Refresh))
+            }
+            MonitorCommand::Read { .. } => {
+                commands.retain(|(cmd, _)| !matches!(cmd, MonitorCommand::Read { .. }))
+            }
+            MonitorCommand::Apply {
+                id,
+                levels,
+                generation,
+            } => {
+                if let Some((
+                    MonitorCommand::Apply {
+                        id: last_id,
+                        levels: last,
+                        generation: last_gen,
+                    },
+                    due,
+                )) = commands.iter_mut().rev().find(|(cmd, _)| match cmd {
+                    MonitorCommand::Apply { id: queued_id, .. } => queued_id == id,
+                    _ => false,
+                }) && id == last_id
+                {
+                    if levels.brightness.is_some() {
+                        last.brightness = levels.brightness;
+                    }
+                    if levels.contrast.is_some() {
+                        last.contrast = levels.contrast;
+                    }
+                    *last_gen = *generation;
+                    *due = Instant::now() + Duration::from_millis(100);
+                    self.wake.notify_one();
+                    return;
+                }
+            }
+            MonitorCommand::Ambient { id, .. } => {
+                commands.retain(|(cmd, _)| !matches!(cmd, MonitorCommand::Ambient { id: queued_id, .. } | MonitorCommand::Apply { id: queued_id, .. } if queued_id == id));
+            }
+        }
+        let delay = if matches!(command, MonitorCommand::Apply { .. }) {
+            Duration::from_millis(100)
+        } else {
+            Duration::ZERO
+        };
+        commands.push_back((command, Instant::now() + delay));
+        self.wake.notify_one();
+    }
+
+    fn receive(&self) -> MonitorCommand {
+        let mut commands = lock(&self.commands);
+        loop {
+            if let Some((_, due)) = commands.front() {
+                let remaining = due.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return commands
+                        .pop_front()
+                        .expect("invariant: queue front exists while locked")
+                        .0;
+                }
+                (commands, _) = self
+                    .wake
+                    .wait_timeout(commands, remaining)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            } else {
+                commands = self
+                    .wake
+                    .wait(commands)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+    }
+}
+
+static MONITOR_QUEUE: OnceLock<MonitorQueue> = OnceLock::new();
+
+fn send_monitor_command(command: MonitorCommand) {
+    MONITOR_QUEUE
+        .get_or_init(MonitorQueue::default)
+        .send(command);
+}
+
+fn refresh_monitors_async(explicit: bool) {
+    {
+        let mut snapshot = lock(shared_snapshot());
+        snapshot.refreshing |= explicit;
+        snapshot.loading = snapshot.levels.is_none();
+    }
+    publish_snapshot();
+    send_monitor_command(MonitorCommand::Refresh);
+}
+
+fn sync_monitor_snapshot(snapshot: &mut UiSnapshot, monitors: &[MonitorInfo], generation: u64) {
+    let selected_id = snapshot
+        .selected_monitor()
+        .map(|monitor| monitor.id.clone());
+    snapshot.monitors = monitors
         .iter()
         .map(|monitor| UiMonitor {
             id: monitor.id.clone(),
             name: monitor.name.clone(),
             is_primary: monitor.is_primary,
+            ready: monitor.levels.is_some(),
         })
         .collect();
-    ui_monitors.sort_by_key(|monitor| !monitor.is_primary);
-
-    let mut snapshot = shared_snapshot().lock().unwrap();
-    let selected_id = preserve_id.map(str::to_owned).or_else(|| {
-        snapshot
-            .selected_monitor()
-            .map(|monitor| monitor.id.clone())
-    });
-
-    let prev_selected_id = snapshot.selected_monitor().map(|m| m.id.clone());
-    let id_changed =
-        prev_selected_id.is_none() || selected_id.is_none() || prev_selected_id != selected_id;
-
-    snapshot.monitors = ui_monitors;
-    snapshot.selected = selected_id
-        .as_deref()
-        .and_then(|id| {
-            snapshot
-                .monitors
-                .iter()
-                .position(|monitor| monitor.id == id)
-        })
-        .unwrap_or(0);
-    if id_changed {
-        snapshot.levels = None;
+    snapshot.selected = choose_selected_index(
+        &snapshot.monitors,
+        selected_id.as_deref(),
+        snapshot.selection_explicit,
+    );
+    let selected = monitors.get(snapshot.selected);
+    let selection_changed = selected.map(|monitor| monitor.id.as_str()) != selected_id.as_deref();
+    if selection_changed {
+        snapshot.selection_explicit = false;
     }
-    snapshot.loading = false;
+    if selection_changed || snapshot.load_generation == generation {
+        snapshot.levels = selected.and_then(|monitor| monitor.levels);
+        snapshot.error = selected.and_then(|monitor| monitor.level_error.clone());
+        snapshot.loading = false;
+    }
     snapshot.refreshing = false;
-    snapshot.error = None;
-    snapshot.ambient_available = *state.ambient_light_available.lock().unwrap();
-
-    let config = state.config.lock().unwrap();
-    snapshot.autostart_enabled = config.autostart_enabled;
-    snapshot.log_level = config.log_level.clone();
 }
 
-fn refresh_monitors_sync(state: &AppState) -> std::result::Result<(), String> {
-    let monitor_list = modules::monitor::get_monitor_list_sync()?;
-    {
-        let mut config = state.config.lock().unwrap();
-        if config.merge_connected_monitors(&monitor_list) {
-            config.save()?;
-        }
-    }
-    *state.monitors.lock().unwrap() = monitor_list;
-    Ok(())
-}
-
-fn refresh_monitors_async(explicit: bool) {
-    {
-        let mut snapshot = shared_snapshot().lock().unwrap();
-        snapshot.loading = true;
-        if explicit {
-            snapshot.refreshing = true;
-        }
-        snapshot.error = None;
-    }
-    publish_snapshot();
-
-    thread::spawn(|| {
-        let state = APP_STATE.get().expect("app state is initialized");
-        let selected = shared_snapshot()
-            .lock()
-            .unwrap()
-            .selected_monitor()
-            .map(|monitor| monitor.id.clone());
-        match refresh_monitors_sync(state) {
-            Ok(()) => {
-                refresh_snapshot_from_state(selected.as_deref());
-                publish_snapshot();
-                load_selected_levels();
-            }
-            Err(err) => {
-                let mut snapshot = shared_snapshot().lock().unwrap();
-                snapshot.loading = false;
-                snapshot.refreshing = false;
-                snapshot.error = Some(err);
+fn start_monitor_worker() -> std::io::Result<()> {
+    thread::Builder::new()
+        .name("monitor-control".into())
+        .spawn(|| {
+            let mut monitors = Vec::new();
+            let mut startup_retries = 2;
+            loop {
+                let command = MONITOR_QUEUE.get_or_init(MonitorQueue::default).receive();
+                if matches!(command, MonitorCommand::Refresh) {
+                    let generation = lock(shared_snapshot()).load_generation;
+                    match modules::monitor::get_monitor_list_sync() {
+                        Ok(discovered) => {
+                            monitors = discovered;
+                            sync_monitor_snapshot(
+                                &mut lock(shared_snapshot()),
+                                &monitors,
+                                generation,
+                            );
+                        }
+                        Err(err) => {
+                            let mut snapshot = lock(shared_snapshot());
+                            snapshot.loading = false;
+                            snapshot.refreshing = false;
+                            snapshot.error = Some(err);
+                        }
+                    }
+                    if startup_retries > 0
+                        && (monitors.is_empty()
+                            || monitors.iter().any(|monitor| monitor.levels.is_none()))
+                    {
+                        startup_retries -= 1;
+                        MONITOR_QUEUE
+                            .get_or_init(MonitorQueue::default)
+                            .retry_discovery();
+                    } else {
+                        startup_retries = 0;
+                    }
+                    publish_snapshot();
+                    continue;
+                }
+                let (id, generation) = match &command {
+                    MonitorCommand::Read { id, generation }
+                    | MonitorCommand::Apply { id, generation, .. }
+                    | MonitorCommand::Ambient { id, generation } => (id, *generation),
+                    MonitorCommand::Refresh => unreachable!("refresh handled above"),
+                };
+                // Reads superseded by navigation or a slider edit need no hardware work.
+                if matches!(command, MonitorCommand::Read { .. })
+                    && lock(shared_snapshot()).load_generation != generation
+                {
+                    continue;
+                }
+                let monitor = monitors.iter_mut().find(|monitor| monitor.id == *id);
+                let result = match monitor {
+                    Some(monitor) => {
+                        let result = match &command {
+                            MonitorCommand::Read { .. } => {
+                                modules::monitor::read_monitor_levels(monitor)
+                                    .map(|levels| monitor.levels = Some(levels))
+                            }
+                            MonitorCommand::Apply { levels, .. } => {
+                                modules::monitor::apply_levels(monitor, *levels)
+                            }
+                            MonitorCommand::Ambient { .. } => {
+                                modules::sensor::get_light_sensor_lux().and_then(|lux| {
+                                    let mut requested = ambient_levels(lux);
+                                    if let Some(supported) = monitor.levels {
+                                        if supported.brightness.is_none() {
+                                            requested.brightness = None;
+                                        }
+                                        if supported.contrast.is_none() {
+                                            requested.contrast = None;
+                                        }
+                                    }
+                                    modules::monitor::apply_levels(monitor, requested)
+                                })
+                            }
+                            MonitorCommand::Refresh => unreachable!("refresh handled above"),
+                        };
+                        monitor.level_error = result.err();
+                        (monitor.levels, monitor.level_error.clone())
+                    }
+                    None => (
+                        None,
+                        Some("The selected monitor is no longer connected".into()),
+                    ),
+                };
+                let mut snapshot = lock(shared_snapshot());
+                if snapshot.load_generation == generation
+                    && snapshot.selected_monitor().map(|m| m.id.as_str()) == Some(id.as_str())
+                {
+                    snapshot.levels = result.0;
+                    snapshot.error = result.1;
+                    snapshot.loading = false;
+                }
                 drop(snapshot);
                 publish_snapshot();
             }
-        }
-    });
+        })?;
+    Ok(())
+}
+
+fn ambient_levels(lux: f64) -> MonitorLevels {
+    let (brightness, contrast) = match lux {
+        x if x < 10.0 => (20, 40),
+        x if x < 50.0 => (30, 45),
+        x if x < 100.0 => (40, 55),
+        x if x < 200.0 => (50, 65),
+        x if x < 500.0 => (65, 75),
+        x if x < 1000.0 => (80, 85),
+        _ => (100, 95),
+    };
+    MonitorLevels {
+        brightness: Some(brightness),
+        contrast: Some(contrast),
+    }
 }
 
 fn load_selected_levels() {
-    let monitor_id = {
-        let mut snapshot = shared_snapshot().lock().unwrap();
-        let Some(id) = snapshot
-            .selected_monitor()
-            .map(|monitor| monitor.id.clone())
-        else {
-            snapshot.loading = false;
-            snapshot.levels = None;
-            drop(snapshot);
-            publish_snapshot();
-            return;
-        };
-        snapshot.loading = true;
-        snapshot.error = None;
-        snapshot.load_generation = LOAD_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-        id
+    let mut snapshot = lock(shared_snapshot());
+    let Some(id) = snapshot
+        .selected_monitor()
+        .map(|monitor| monitor.id.clone())
+    else {
+        return;
     };
-    let generation = shared_snapshot().lock().unwrap().load_generation;
+    snapshot.load_generation += 1;
+    snapshot.loading = snapshot.levels.is_none();
+    let generation = snapshot.load_generation;
+    drop(snapshot);
     publish_snapshot();
-
-    thread::spawn(move || {
-        let result = {
-            let state = APP_STATE.get().expect("app state is initialized");
-            let mut monitors = state.monitors.lock().unwrap();
-            monitors
-                .iter_mut()
-                .find(|monitor| monitor.id == monitor_id)
-                .ok_or_else(|| "The selected monitor is no longer connected".to_string())
-                .and_then(modules::monitor::get_monitor_levels)
-        };
-        let mut snapshot = shared_snapshot().lock().unwrap();
-        if snapshot.load_generation != generation
-            || snapshot.selected_monitor().map(|m| m.id.as_str()) != Some(monitor_id.as_str())
-        {
-            return;
-        }
-        snapshot.loading = false;
-        match result {
-            Ok(levels) => snapshot.levels = Some(levels),
-            Err(err) => {
-                snapshot.levels = None;
-                snapshot.error = Some(err);
-            }
-        }
-        drop(snapshot);
-        publish_snapshot();
-    });
+    send_monitor_command(MonitorCommand::Read { id, generation });
 }
 
-#[derive(Clone, Copy)]
-enum LevelKind {
-    Brightness,
-    Contrast,
-}
-
-fn commit_level(monitor_id: String, kind: LevelKind, value: u32) {
-    thread::spawn(move || {
-        let result = {
-            let state = APP_STATE.get().expect("app state is initialized");
-            let mut monitors = state.monitors.lock().unwrap();
-            let monitor = monitors
-                .iter_mut()
-                .find(|monitor| monitor.id == monitor_id)
-                .ok_or_else(|| "The selected monitor is no longer connected".to_string());
-            monitor.and_then(|monitor| match kind {
-                LevelKind::Brightness => {
-                    modules::monitor::set_monitor_brightness_only(monitor, value)
-                }
-                LevelKind::Contrast => modules::monitor::set_monitor_contrast_only(monitor, value),
-            })
-        };
-        if let Err(err) = result {
-            shared_snapshot().lock().unwrap().error = Some(err);
-            publish_snapshot();
-        } else {
-            load_selected_levels();
-        }
-    });
-}
-
-fn apply_ambient(monitor_id: String) {
-    thread::spawn(move || {
-        let result = (|| {
-            let state = APP_STATE.get().expect("app state is initialized");
-            if !*state.ambient_light_available.lock().unwrap() {
-                return Err("No ambient light sensor is available".to_string());
-            }
-            let lux = modules::sensor::get_light_sensor_lux()?;
-            let (brightness, contrast) = match lux {
-                x if x < 10.0 => (20, 40),
-                x if x < 50.0 => (30, 45),
-                x if x < 100.0 => (40, 55),
-                x if x < 200.0 => (50, 65),
-                x if x < 500.0 => (65, 75),
-                x if x < 1000.0 => (80, 85),
-                _ => (100, 95),
-            };
-            let mut monitors = state.monitors.lock().unwrap();
-            let monitor = monitors
-                .iter_mut()
-                .find(|monitor| monitor.id == monitor_id)
-                .ok_or_else(|| "The selected monitor is no longer connected".to_string())?;
-            modules::monitor::set_monitor_settings_with_cache(monitor, brightness, contrast)?;
-            Ok(())
-        })();
-        match result {
-            Ok(()) => load_selected_levels(),
-            Err(err) => {
-                shared_snapshot().lock().unwrap().error = Some(err);
-                publish_snapshot();
-            }
-        }
-    });
+fn apply_ambient(id: String) {
+    let mut snapshot = lock(shared_snapshot());
+    snapshot.load_generation += 1;
+    let generation = snapshot.load_generation;
+    drop(snapshot);
+    send_monitor_command(MonitorCommand::Ambient { id, generation });
 }
 
 fn navigate_monitor(delta: isize) {
-    {
-        let mut snapshot = shared_snapshot().lock().unwrap();
-        let count = snapshot.monitors.len();
-        if count == 0 {
-            return;
-        }
-        snapshot.selected =
-            (snapshot.selected as isize + delta).rem_euclid(count as isize) as usize;
-        snapshot.levels = None;
-        snapshot.error = None;
+    let mut snapshot = lock(shared_snapshot());
+    let count = snapshot.monitors.len();
+    if count == 0 {
+        return;
     }
-    publish_snapshot();
+    snapshot.selection_explicit = true;
+    snapshot.selected = (snapshot.selected as isize + delta).rem_euclid(count as isize) as usize;
+    snapshot.levels = None;
+    snapshot.error = None;
+    drop(snapshot);
     load_selected_levels();
 }
 
 fn update_local_level(kind: LevelKind, value: u32) {
-    let mut snapshot = shared_snapshot().lock().unwrap();
-    let monitor_id = snapshot.selected_monitor().map(|m| m.id.clone());
-    let mut levels = snapshot.levels.unwrap_or(MonitorLevels {
-        brightness: 0,
-        contrast: 0,
-    });
-    match kind {
-        LevelKind::Brightness => levels.brightness = value,
-        LevelKind::Contrast => levels.contrast = value,
+    let mut snapshot = lock(shared_snapshot());
+    let Some(id) = snapshot
+        .selected_monitor()
+        .map(|monitor| monitor.id.clone())
+    else {
+        return;
+    };
+    let Some(mut levels) = snapshot.levels else {
+        return;
+    };
+    let channel = match kind {
+        LevelKind::Brightness => &mut levels.brightness,
+        LevelKind::Contrast => &mut levels.contrast,
+    };
+    if *channel == Some(value) || channel.is_none() {
+        return;
     }
+    *channel = Some(value);
     snapshot.levels = Some(levels);
+    snapshot.load_generation += 1;
+    let generation = snapshot.load_generation;
+    let requested = match kind {
+        LevelKind::Brightness => MonitorLevels {
+            brightness: Some(value),
+            contrast: None,
+        },
+        LevelKind::Contrast => MonitorLevels {
+            brightness: None,
+            contrast: Some(value),
+        },
+    };
     drop(snapshot);
     publish_snapshot();
+    send_monitor_command(MonitorCommand::Apply {
+        id,
+        levels: requested,
+        generation,
+    });
+}
 
-    if let Some(id) = monitor_id {
-        *PENDING_COMMIT.lock().unwrap() = Some((id, kind, value));
+fn apply_settings_to_snapshot(autostart_enabled: bool, log_level: &str) {
+    let mut snapshot = lock(shared_snapshot());
+    snapshot.autostart_enabled = autostart_enabled;
+    snapshot.log_level = log_level.to_string();
+}
+
+fn settings_are_open() -> bool {
+    lock(shared_snapshot()).current_view == ActiveView::Settings
+}
+
+fn update_setting(change: impl FnOnce(&mut AppConfig)) {
+    let mut current = lock(shared_config());
+    let mut next = current.clone();
+    change(&mut next);
+    if next == *current {
+        return;
     }
+    let result = next
+        .validate()
+        .and_then(|()| set_autostart(next.autostart_enabled))
+        .and_then(|()| next.save());
+    if let Err(err) = result {
+        if let Err(rollback) = set_autostart(current.autostart_enabled) {
+            error!("Autostart rollback failed: {rollback}");
+        }
+        drop(current);
+        lock(shared_snapshot()).error = Some(err);
+    } else {
+        modules::logger::apply_log_level(&next.log_level);
+        apply_settings_to_snapshot(next.autostart_enabled, &next.log_level);
+        *current = next;
+        drop(current);
+    }
+    publish_snapshot();
 }
 
 fn update_autostart(enable: bool) {
-    let state = APP_STATE.get().expect("app state is initialized");
-    let mut config = state.config.lock().unwrap().clone();
-    config.autostart_enabled = enable;
-    if let Err(err) = config.save() {
-        error!("Failed to save config: {err}");
-        let mut snapshot = shared_snapshot().lock().unwrap();
-        snapshot.error = Some(err);
-        drop(snapshot);
-        publish_snapshot();
-        return;
-    }
-    if let Err(err) = set_autostart(enable) {
-        error!("Failed to set registry autostart: {err}");
-        let mut snapshot = shared_snapshot().lock().unwrap();
-        snapshot.error = Some(err);
-        drop(snapshot);
-        publish_snapshot();
-        return;
-    }
-    *state.config.lock().unwrap() = config;
-    refresh_snapshot_from_state(None);
-    publish_snapshot();
+    update_setting(|config| config.autostart_enabled = enable);
 }
 
 fn update_log_level(level: String) {
-    let state = APP_STATE.get().expect("app state is initialized");
-    let mut config = state.config.lock().unwrap().clone();
-    config.log_level = level.clone();
-    if let Err(err) = config.save() {
-        error!("Failed to save config: {err}");
-        let mut snapshot = shared_snapshot().lock().unwrap();
-        snapshot.error = Some(err);
-        drop(snapshot);
-        publish_snapshot();
-        return;
-    }
-
-    let level_filter = match level.to_lowercase().as_str() {
-        "error" => log::LevelFilter::Error,
-        "warn" => log::LevelFilter::Warn,
-        "info" => log::LevelFilter::Info,
-        "debug" => log::LevelFilter::Debug,
-        _ => log::LevelFilter::Warn,
-    };
-    log::set_max_level(level_filter);
-
-    *state.config.lock().unwrap() = config;
-    refresh_snapshot_from_state(None);
-    publish_snapshot();
+    update_setting(|config| config.log_level = level);
 }
 
 fn app(cx: &mut RenderCx) -> Element {
-    let initial = shared_snapshot().lock().unwrap().clone();
-    let (snapshot, setter) = cx.use_async_state(initial);
-    *UI_SETTER.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(setter);
+    let initial = lock(shared_snapshot());
+    let (snapshot, setter) = cx.use_async_state(initial.clone());
+    UI_SETTER.get_or_init(|| setter);
+    drop(initial);
 
     let main_inner: Element = if snapshot.monitors.is_empty() {
         vstack((
-            subtitle("No compatible monitors"),
-            body("Connect a DDC/CI monitor, then refresh."),
-            button("Refresh").on_click(|| refresh_monitors_async(true)),
+            subtitle(if snapshot.loading {
+                "Discovering monitors…"
+            } else {
+                "No compatible monitors"
+            }),
+            body(if snapshot.loading {
+                "Reading connected displays."
+            } else {
+                "Connect a DDC/CI monitor, then refresh."
+            }),
+            button("Refresh")
+                .enabled(!snapshot.loading)
+                .on_click(|| refresh_monitors_async(true)),
         ))
         .spacing(12.0)
         .into()
     } else {
-        let monitor = snapshot.selected_monitor().unwrap().clone();
+        let monitor = snapshot
+            .selected_monitor()
+            .expect("invariant: selection indexes a nonempty list");
         let count = snapshot.monitors.len();
         let header = grid((
             body_strong(if monitor.is_primary {
@@ -490,7 +642,8 @@ fn app(cx: &mut RenderCx) -> Element {
             vstack((
                 vstack((
                     body_strong("Brightness"),
-                    Slider::new(levels.brightness as f64)
+                    Slider::new(levels.brightness.unwrap_or(0) as f64)
+                        .enabled(levels.brightness.is_some())
                         .range(0.0, 100.0)
                         .step(1.0)
                         .on_value_changed(|value: f64| {
@@ -502,7 +655,8 @@ fn app(cx: &mut RenderCx) -> Element {
                 .spacing(6.0),
                 vstack((
                     body_strong("Contrast"),
-                    Slider::new(levels.contrast as f64)
+                    Slider::new(levels.contrast.unwrap_or(0) as f64)
+                        .enabled(levels.contrast.is_some())
                         .range(0.0, 100.0)
                         .step(1.0)
                         .on_value_changed(|value: f64| {
@@ -532,7 +686,7 @@ fn app(cx: &mut RenderCx) -> Element {
                 .padding(0.0)
                 .subtle()
                 .on_click(|| {
-                    shared_snapshot().lock().unwrap().current_view = ActiveView::Main;
+                    lock(shared_snapshot()).current_view = ActiveView::Main;
                     publish_snapshot();
                 })
                 .automation_name("Back to main"),
@@ -548,22 +702,25 @@ fn app(cx: &mut RenderCx) -> Element {
             ToggleSwitch::new(snapshot.autostart_enabled)
                 .header("Start with Windows")
                 .on_toggled(|value: bool| {
-                    update_autostart(value);
+                    if settings_are_open() {
+                        update_autostart(value);
+                    }
                 })
                 .horizontal_alignment(HorizontalAlignment::Stretch),
             ComboBox::new(vec!["Error", "Warn", "Info", "Debug"])
                 .header("Log level")
                 .selected_index(match snapshot.log_level.to_lowercase().as_str() {
                     "error" => 0,
-                    "warn" => 1,
                     "info" => 2,
                     "debug" => 3,
                     _ => 1,
                 })
                 .on_selection_changed(|index: i32| {
+                    if !settings_are_open() {
+                        return;
+                    }
                     let level = match index {
                         0 => "error",
-                        1 => "warn",
                         2 => "info",
                         3 => "debug",
                         _ => "warn",
@@ -645,7 +802,7 @@ fn app(cx: &mut RenderCx) -> Element {
             .subtle()
             .tooltip("Settings")
             .on_click(|| {
-                shared_snapshot().lock().unwrap().current_view = ActiveView::Settings;
+                lock(shared_snapshot()).current_view = ActiveView::Settings;
                 publish_snapshot();
             })
             .grid_column(1)
@@ -741,52 +898,18 @@ fn set_autostart(enable: bool) -> std::result::Result<(), String> {
             std::env::current_exe().map_err(|e| format!("Failed to get exe path: {e}"))?;
         key.set_value("XCreen", &format!("\"{}\"", exe_path.display()))
             .map_err(|e| format!("Failed to set registry value: {e}"))?;
-    } else if let Ok(key) = hkcu.open_subkey_with_flags(
-        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
-        KEY_SET_VALUE,
-    ) {
-        let _ = key.delete_value("XCreen");
-    }
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn open_config_file() -> std::result::Result<(), String> {
-    use windows::Win32::UI::Shell::ShellExecuteW;
-    use windows::Win32::UI::WindowsAndMessaging::SW_SHOW;
-    use windows::core::PCWSTR;
-
-    let config_path = AppConfig::get_config_path()?;
-    let path_str = config_path.to_string_lossy();
-    let mut path_u16: Vec<u16> = path_str.encode_utf16().collect();
-    path_u16.push(0);
-    let lpfile = PCWSTR::from_raw(path_u16.as_ptr());
-
-    unsafe {
-        let instance = ShellExecuteW(None, windows::core::w!("open"), lpfile, None, None, SW_SHOW);
-        let status = instance.0 as isize;
-        if status == 31 {
-            // SE_ERR_NOASSOC
-            let instance_openas = ShellExecuteW(
-                None,
-                windows::core::w!("openas"),
-                lpfile,
-                None,
-                None,
-                SW_SHOW,
-            );
-            let status_openas = instance_openas.0 as isize;
-            if status_openas <= 32 {
-                return Err(format!(
-                    "Failed to open config file: ShellExecuteW(openas) returned {}",
-                    status_openas
-                ));
-            }
-        } else if status <= 32 {
-            return Err(format!(
-                "Failed to open config file: ShellExecuteW(open) returned {}",
-                status
-            ));
+    } else {
+        match hkcu.open_subkey_with_flags(
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+            KEY_SET_VALUE,
+        ) {
+            Ok(key) => match key.delete_value("XCreen") {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(format!("Failed to remove autostart: {err}")),
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(format!("Failed to open autostart registry: {err}")),
         }
     }
     Ok(())
@@ -802,31 +925,17 @@ fn load_icon() -> std::result::Result<Icon, Box<dyn std::error::Error>> {
 
 unsafe extern "system" fn find_thread_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let mut title_buf = [0u16; 512];
+    // SAFETY: hwnd comes from EnumThreadWindows; the supplied title buffer is writable.
     let len =
         unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(hwnd, &mut title_buf) };
     let title = String::from_utf16_lossy(&title_buf[..len as usize]);
 
-    let mut class_buf = [0u16; 512];
-    let class_len =
-        unsafe { windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hwnd, &mut class_buf) };
-    let class_name = String::from_utf16_lossy(&class_buf[..class_len as usize]);
-
     if title == "XCreenFlyout" {
+        // SAFETY: lparam points to the HWND local in current_thread_window during enumeration.
         unsafe {
             *(lparam.0 as *mut HWND) = hwnd;
         }
         return BOOL(0); // Stop enumeration
-    }
-
-    if !class_name.contains("InputNonClientPointerSource")
-        && !class_name.contains("DesktopWindowTreeSource")
-    {
-        unsafe {
-            let backup_hwnd = lparam.0 as *mut HWND;
-            if (*backup_hwnd).0 == 0 {
-                *backup_hwnd = hwnd;
-            }
-        }
     }
 
     BOOL(1) // Continue enumeration
@@ -834,6 +943,7 @@ unsafe extern "system" fn find_thread_window(hwnd: HWND, lparam: LPARAM) -> BOOL
 
 fn current_thread_window() -> Option<HWND> {
     let mut hwnd = HWND::default();
+    // SAFETY: Enumeration is synchronous and hwnd remains writable until it returns.
     unsafe {
         let _ = EnumThreadWindows(
             GetCurrentThreadId(),
@@ -845,6 +955,8 @@ fn current_thread_window() -> Option<HWND> {
 }
 
 fn configure_flyout_window(hwnd: HWND) {
+    // SAFETY: hwnd is the owned flyout on its UI thread; DWM attribute pointers
+    // have matching sizes and remain valid throughout their synchronous calls.
     unsafe {
         let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
         let remove = (WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU).0;
@@ -888,6 +1000,7 @@ fn configure_flyout_window(hwnd: HWND) {
 fn get_monitor_dpi(hmonitor: windows::Win32::Graphics::Gdi::HMONITOR) -> u32 {
     let mut dpi_x = 0;
     let mut dpi_y = 0;
+    // SAFETY: Both output pointers reference live u32 values. Invalid monitors return an error.
     unsafe {
         if GetDpiForMonitor(hmonitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y).is_ok() {
             dpi_x
@@ -898,6 +1011,8 @@ fn get_monitor_dpi(hmonitor: windows::Win32::Graphics::Gdi::HMONITOR) -> u32 {
 }
 
 fn position_flyout(hwnd: HWND, anchor_x: i32, anchor_y: i32) {
+    // SAFETY: hwnd belongs to this UI thread, output structures are initialized,
+    // and monitor information is checked before using its bounds.
     unsafe {
         let monitor = MonitorFromPoint(
             POINT {
@@ -934,7 +1049,7 @@ fn position_flyout(hwnd: HWND, anchor_x: i32, anchor_y: i32) {
         let actual_width = rect.right - rect.left;
         let actual_height = rect.bottom - rect.top;
 
-        let screen = info.rcMonitor;
+        let screen = info.rcWork;
         let gap = (12.0 * dpi as f64 / 96.0).round() as i32;
 
         let (x, y) = calculate_flyout_position(screen, actual_width, actual_height, gap);
@@ -959,6 +1074,7 @@ fn calculate_flyout_position(screen: RECT, width: i32, height: i32, gap: i32) ->
 }
 
 fn dismiss_tray_menu() {
+    // SAFETY: The PID output is live, and the posted message has no pointer payload.
     unsafe {
         let fg = GetForegroundWindow();
         if fg.0 != 0 {
@@ -971,38 +1087,142 @@ fn dismiss_tray_menu() {
     }
 }
 
+fn window_belongs_to_flyout(flyout: HWND, candidate: HWND) -> bool {
+    // SAFETY: GetAncestor accepts window handles and returns null for invalid ones.
+    candidate.0 != 0
+        && (candidate == flyout || unsafe { GetAncestor(candidate, GA_ROOTOWNER) == flyout })
+}
+
+unsafe extern "system" fn flyout_subclass(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    match msg {
+        WM_SHOW_FLYOUT => {
+            *lock(&SHOWN_AT) = Some(Instant::now());
+            let x = wparam.0 as i32;
+            let y = lparam.0 as i32;
+            position_flyout(hwnd, x, y);
+            // SAFETY: Window visibility and timer changes run on the owning UI thread.
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_SHOW);
+                SetTimer(hwnd, DISMISS_TIMER, 75, None);
+            }
+            // SAFETY: hwnd is this window on its owning message thread.
+            unsafe {
+                let _ = SetForegroundWindow(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_HIDE_FLYOUT => {
+            // SAFETY: This window and timer belong to the current UI thread.
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                let _ = KillTimer(hwnd, DISMISS_TIMER);
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == DISMISS_TIMER => {
+            let shown_recently =
+                lock(&SHOWN_AT).is_some_and(|shown| shown.elapsed() < FLYOUT_DISMISS_GRACE);
+            // SAFETY: hwnd is the subclassed flyout. Key/foreground queries take no pointers.
+            unsafe {
+                if GetAsyncKeyState(VK_ESCAPE.0 as i32) < 0
+                    || (!shown_recently && !window_belongs_to_flyout(hwnd, GetForegroundWindow()))
+                {
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                    let _ = KillTimer(hwnd, DISMISS_TIMER);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == DISCOVERY_TIMER => {
+            // SAFETY: The timer belongs to this subclassed window and is no longer needed.
+            unsafe {
+                let _ = KillTimer(hwnd, DISCOVERY_TIMER);
+            }
+            refresh_monitors_async(false);
+            LRESULT(0)
+        }
+        WM_DISPLAYCHANGE => {
+            // SAFETY: Setting the same window timer replaces its previous deadline.
+            unsafe {
+                SetTimer(hwnd, DISCOVERY_TIMER, 300, None);
+            }
+            // SAFETY: Forward this unmodified window message to the previous procedure.
+            unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+        }
+        WM_POWERBROADCAST if wparam.0 == PBT_APMRESUMEAUTOMATIC => {
+            // SAFETY: This timer is attached to the current window's message thread.
+            unsafe {
+                SetTimer(hwnd, DISCOVERY_TIMER, 1000, None);
+            }
+            LRESULT(1)
+        }
+        // SAFETY: Forward the unmodified message received by this installed subclass.
+        _ => unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) },
+    }
+}
+
+fn request_show_flyout(anchor_x: i32, anchor_y: i32) {
+    let hwnd = HWND(FLYOUT_HWND.load(Ordering::SeqCst));
+    if hwnd.0 == 0 {
+        return;
+    }
+    dismiss_tray_menu();
+    // SAFETY: The posted coordinates are integers; no borrowed pointers cross threads.
+    unsafe {
+        let _ = PostMessageW(
+            hwnd,
+            WM_SHOW_FLYOUT,
+            WPARAM(anchor_x as isize as usize),
+            LPARAM(anchor_y as isize),
+        );
+    }
+    if lock(shared_snapshot()).monitors.is_empty() {
+        refresh_monitors_async(false);
+    } else {
+        load_selected_levels();
+    }
+}
+
+fn request_hide_flyout() {
+    let hwnd = HWND(FLYOUT_HWND.load(Ordering::SeqCst));
+    if hwnd.0 == 0 {
+        return;
+    }
+    // SAFETY: This message carries no pointers and runs visibility changes on the UI thread.
+    unsafe {
+        let _ = PostMessageW(hwnd, WM_HIDE_FLYOUT, None, None);
+    }
+}
+
 fn toggle_flyout(anchor_x: i32, anchor_y: i32) {
     let hwnd = HWND(FLYOUT_HWND.load(Ordering::SeqCst));
     if hwnd.0 == 0 {
         return;
     }
+    // SAFETY: IsWindowVisible accepts a window handle and has no output pointers.
     unsafe {
         if IsWindowVisible(hwnd).as_bool() {
-            let _ = ShowWindow(hwnd, SW_HIDE);
+            request_hide_flyout();
         } else {
-            dismiss_tray_menu();
-            position_flyout(hwnd, anchor_x, anchor_y);
-            refresh_monitors_async(false);
-            let _ = ShowWindow(hwnd, SW_SHOW);
-            let _ = SetForegroundWindow(hwnd);
+            request_show_flyout(anchor_x, anchor_y);
         }
     }
 }
 
 fn show_flyout_default() {
-    let hwnd = HWND(FLYOUT_HWND.load(Ordering::SeqCst));
-    if hwnd.0 == 0 {
-        return;
-    }
     let mut cursor_point = POINT::default();
+    // SAFETY: cursor_point is a live writable POINT during the synchronous call.
     unsafe {
-        dismiss_tray_menu();
         let _ = windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut cursor_point);
-        position_flyout(hwnd, cursor_point.x, cursor_point.y);
-        let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = SetForegroundWindow(hwnd);
     }
-    refresh_monitors_async(false);
+    request_show_flyout(cursor_point.x, cursor_point.y);
 }
 
 fn start_tray_event_threads() {
@@ -1032,37 +1252,6 @@ fn start_tray_event_threads() {
             }
         }
     });
-
-    thread::spawn(|| {
-        loop {
-            thread::sleep(Duration::from_millis(75));
-            let hwnd = HWND(FLYOUT_HWND.load(Ordering::SeqCst));
-
-            let is_lbutton_down = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 };
-            if !is_lbutton_down {
-                let pending = {
-                    let mut lock = PENDING_COMMIT.lock().unwrap();
-                    lock.take()
-                };
-                if let Some((monitor_id, kind, value)) = pending {
-                    commit_level(monitor_id, kind, value);
-                }
-            }
-
-            if hwnd.0 == 0 {
-                continue;
-            }
-            unsafe {
-                if IsWindowVisible(hwnd).as_bool() {
-                    let escaped = GetAsyncKeyState(VK_ESCAPE.0 as i32) < 0;
-                    let foreground = GetForegroundWindow();
-                    if escaped || foreground != hwnd {
-                        let _ = ShowWindow(hwnd, SW_HIDE);
-                    }
-                }
-            }
-        }
-    });
 }
 
 fn create_tray() -> std::result::Result<TrayIcon, Box<dyn std::error::Error>> {
@@ -1085,11 +1274,19 @@ fn create_tray() -> std::result::Result<TrayIcon, Box<dyn std::error::Error>> {
 }
 
 fn init_dark_mode() {
-    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    use windows::Win32::System::LibraryLoader::{
+        GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+    };
     use windows::core::PCSTR;
 
+    // SAFETY: Only the system copy of uxtheme is loaded and retained for process
+    // lifetime. Ordinal 135 uses the PreferredAppMode ABI on supported Windows 11.
     unsafe {
-        if let Ok(uxtheme) = LoadLibraryW(windows::core::w!("uxtheme.dll")) {
+        if let Ok(uxtheme) = LoadLibraryExW(
+            windows::core::w!("uxtheme.dll"),
+            None,
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
+        ) {
             let ord_135 = PCSTR::from_raw(135 as *const u8);
             if let Some(set_preferred_app_mode) = GetProcAddress(uxtheme, ord_135) {
                 // PreferredAppMode: AllowDark = 1
@@ -1103,43 +1300,60 @@ fn init_dark_mode() {
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     init_dark_mode();
-    let config = AppConfig::load().unwrap_or_else(|err| {
-        eprintln!("Config load error, using defaults: {err}");
-        AppConfig::default()
-    });
-    if let Err(err) = set_autostart(config.autostart_enabled) {
-        eprintln!("Failed to apply autostart configuration: {err}");
+    let loaded = AppConfig::load();
+    let config = loaded.as_ref().cloned().unwrap_or_default();
+    modules::logger::init_logger(&config.log_level)?;
+    if let Err(err) = loaded {
+        warn!("Config load error, using defaults: {err}");
     }
-    if let Err(err) = modules::logger::init_logger(&config.log_level) {
-        eprintln!("Logger init failed: {err}");
+    if let Err(err) = set_autostart(config.autostart_enabled) {
+        error!("Failed to apply autostart configuration: {err}");
     }
 
     let ambient_available = modules::sensor::has_light_sensor();
-    let state = AppState::new(config, ambient_available);
-    if let Err(err) = refresh_monitors_sync(&state) {
-        error!("Failed to initialize monitors: {err}");
-    }
-    APP_STATE
-        .set(state)
-        .map_err(|_| "app state initialized twice")?;
+    let mut snapshot = UiSnapshot::empty(ambient_available);
+    snapshot.autostart_enabled = config.autostart_enabled;
+    snapshot.log_level = config.log_level.clone();
+    CONFIG
+        .set(Mutex::new(config))
+        .map_err(|_| "config initialized twice")?;
     UI_SNAPSHOT
-        .set(Arc::new(Mutex::new(UiSnapshot::empty(ambient_available))))
+        .set(Mutex::new(snapshot))
         .map_err(|_| "UI snapshot initialized twice")?;
-    refresh_snapshot_from_state(None);
+    start_monitor_worker()?;
+    refresh_monitors_async(false);
 
-    let watcher_state = APP_STATE.get().unwrap().clone();
-    let _watcher = modules::watcher::start_config_watcher(move |mut config| {
-        let monitors = watcher_state.monitors.lock().unwrap().clone();
-        if config.merge_connected_monitors(&monitors) {
-            let _ = config.save();
+    let _watcher = modules::watcher::start_config_watcher(|| {
+        let mut current = lock(shared_config());
+        let config = match AppConfig::load_existing() {
+            Ok(config) => config,
+            Err(err) => {
+                warn!("Failed to reload config: {err}");
+                return;
+            }
+        };
+        let autostart_changed = current.autostart_enabled != config.autostart_enabled;
+        let log_changed = !current.log_level.eq_ignore_ascii_case(&config.log_level);
+        if !autostart_changed && !log_changed {
+            return;
         }
-        if let Err(err) = set_autostart(config.autostart_enabled) {
+        current.autostart_enabled = config.autostart_enabled;
+        current.log_level = config.log_level;
+        let autostart_enabled = current.autostart_enabled;
+        let log_level = current.log_level.clone();
+        if autostart_changed && let Err(err) = set_autostart(autostart_enabled) {
             error!("Failed to apply autostart configuration: {err}");
         }
-        *watcher_state.config.lock().unwrap() = config;
-        refresh_snapshot_from_state(None);
+        if log_changed {
+            modules::logger::apply_log_level(&log_level);
+            info!("Log level updated to {log_level}");
+        }
+        apply_settings_to_snapshot(autostart_enabled, &log_level);
+        drop(current);
         publish_snapshot();
-    });
+    })
+    .map_err(|err| warn!("Config watcher unavailable: {err}"))
+    .ok();
 
     App::new().run_custom(|_| {
         let host = ReactorHost::new_with_window_options(
@@ -1159,14 +1373,22 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         )?;
         host.set_backdrop(Backdrop::Acrylic);
 
-        let hwnd = current_thread_window().expect("Unable to find WinUI window");
+        let hwnd = current_thread_window().ok_or_else(windows_reactor::Error::from_thread)?;
         FLYOUT_HWND.store(hwnd.0, Ordering::SeqCst);
         configure_flyout_window(hwnd);
+        // SAFETY: The callback has the required subclass ABI and is installed on the UI thread.
+        unsafe {
+            if !SetWindowSubclass(hwnd, Some(flyout_subclass), 0x5843_524e, 0).as_bool() {
+                return Err(windows_reactor::Error::from_thread());
+            }
+        }
 
         // Hide window offscreen initially to prevent startup flash
+        // SAFETY: hwnd is the initialized flyout on this thread.
         let dpi = unsafe { GetDpiForWindow(hwnd).max(96) };
         let width = (FLYOUT_WIDTH_DIP * dpi as f64 / 96.0).round() as i32;
         let height = (FLYOUT_HEIGHT_DIP * dpi as f64 / 96.0).round() as i32;
+        // SAFETY: hwnd is the owned flyout, and all position arguments are integers.
         unsafe {
             let _ = SetWindowPos(
                 hwnd,
@@ -1180,14 +1402,15 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         }
 
         host.activate()?;
+        // SAFETY: The activated flyout belongs to this UI thread.
         unsafe {
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
         let tray = match create_tray() {
-            Ok(t) => Some(t),
+            Ok(tray) => tray,
             Err(err) => {
                 error!("Unable to create tray icon: {}", err);
-                None
+                return Err(windows_reactor::Error::from_thread());
             }
         };
         start_tray_event_threads();
@@ -1210,28 +1433,146 @@ impl Component for RenderFnComponent {
 mod tests {
     use super::*;
 
-    #[test]
-    fn monitor_navigation_wraps() {
-        assert_eq!((0isize - 1).rem_euclid(3) as usize, 2);
-        assert_eq!((2isize + 1).rem_euclid(3) as usize, 0);
+    fn monitor(id: &str) -> MonitorInfo {
+        MonitorInfo {
+            id: id.into(),
+            name: id.into(),
+            display_device: "DISPLAY1".into(),
+            display_handle: 0,
+            physical_index: 0,
+            is_primary: false,
+            levels: Some(MonitorLevels {
+                brightness: Some(40),
+                contrast: Some(50),
+            }),
+            level_error: None,
+        }
     }
 
     #[test]
-    fn primary_monitor_sorts_first() {
-        let mut monitors = [
+    fn discovery_preserves_edits_made_while_hardware_was_busy() {
+        let monitors = [monitor("dell")];
+        let mut snapshot = UiSnapshot::empty(false);
+        sync_monitor_snapshot(&mut snapshot, &monitors, 0);
+        snapshot.load_generation = 1;
+        snapshot.levels = Some(MonitorLevels {
+            brightness: Some(75),
+            contrast: Some(50),
+        });
+        sync_monitor_snapshot(&mut snapshot, &monitors, 0);
+        assert_eq!(
+            snapshot.levels.and_then(|levels| levels.brightness),
+            Some(75)
+        );
+        assert_eq!(snapshot.load_generation, 1);
+    }
+
+    #[test]
+    fn disconnect_selects_a_remaining_monitor_and_clears_old_levels() {
+        let mut snapshot = UiSnapshot::empty(false);
+        sync_monitor_snapshot(&mut snapshot, &[monitor("dell"), monitor("lg")], 0);
+        snapshot.selected = 1;
+        let mut remaining = monitor("dell");
+        remaining.levels = None;
+        remaining.level_error = Some("Unavailable".into());
+        sync_monitor_snapshot(&mut snapshot, &[remaining], 0);
+        assert_eq!(
+            snapshot.selected_monitor().map(|m| m.id.as_str()),
+            Some("dell")
+        );
+        assert_eq!(snapshot.levels, None);
+        assert_eq!(snapshot.error.as_deref(), Some("Unavailable"));
+    }
+
+    #[test]
+    fn queued_edits_keep_both_channels_and_latest_value() {
+        let queue = MonitorQueue::default();
+        for (brightness, contrast, generation) in [
+            (Some(20), None, 1),
+            (None, Some(60), 2),
+            (Some(80), None, 3),
+        ] {
+            queue.send(MonitorCommand::Apply {
+                id: "dell".into(),
+                levels: MonitorLevels {
+                    brightness,
+                    contrast,
+                },
+                generation,
+            });
+        }
+        let mut pending = lock(&queue.commands);
+        assert_eq!(pending.len(), 1);
+        let Some((
+            MonitorCommand::Apply {
+                id,
+                levels,
+                generation,
+            },
+            _,
+        )) = pending.pop_front()
+        else {
+            panic!("Expected a queued edit");
+        };
+        assert_eq!(id, "dell");
+        assert_eq!(
+            levels,
+            MonitorLevels {
+                brightness: Some(80),
+                contrast: Some(60)
+            }
+        );
+        assert_eq!(generation, 3);
+    }
+
+    #[test]
+    fn refresh_requests_coalesce_without_losing_other_monitor_edits() {
+        let queue = MonitorQueue::default();
+        queue.send(MonitorCommand::Refresh);
+        queue.send(MonitorCommand::Apply {
+            id: "dell".into(),
+            levels: MonitorLevels {
+                brightness: Some(20),
+                contrast: None,
+            },
+            generation: 1,
+        });
+        queue.send(MonitorCommand::Refresh);
+        queue.send(MonitorCommand::Apply {
+            id: "lg".into(),
+            levels: MonitorLevels {
+                brightness: Some(80),
+                contrast: None,
+            },
+            generation: 2,
+        });
+        let pending = lock(&queue.commands);
+        assert_eq!(pending.len(), 3);
+        assert!(matches!(&pending[0].0, MonitorCommand::Apply { id, .. } if id == "dell"));
+        assert!(matches!(&pending[1].0, MonitorCommand::Refresh));
+        assert!(matches!(&pending[2].0, MonitorCommand::Apply { id, .. } if id == "lg"));
+    }
+
+    #[test]
+    fn opening_selects_controllable_monitor_over_failing_primary() {
+        let monitors = [
             UiMonitor {
-                id: "secondary".into(),
-                name: "B".into(),
-                is_primary: false,
+                id: "laptop".into(),
+                name: "Generic PnP Monitor".into(),
+                is_primary: true,
+                ready: false,
             },
             UiMonitor {
-                id: "primary".into(),
-                name: "A".into(),
-                is_primary: true,
+                id: "dell".into(),
+                name: "Dell P2222H (HDMI)".into(),
+                is_primary: false,
+                ready: true,
             },
         ];
-        monitors.sort_by_key(|monitor| !monitor.is_primary);
-        assert_eq!(monitors[0].id, "primary");
+        assert_eq!(choose_selected_index(&monitors, None, false), 1);
+        assert_eq!(choose_selected_index(&monitors, Some("dell"), true), 1);
+        assert_eq!(choose_selected_index(&monitors, Some("laptop"), false), 1);
+        assert_eq!(choose_selected_index(&monitors, Some("laptop"), true), 0);
     }
 
     #[test]
@@ -1243,8 +1584,18 @@ mod tests {
             bottom: 1080,
         };
         let (left, top) = calculate_flyout_position(screen, 360, 520, 8);
-        assert_eq!(left, 1920 - 360 - 8);
-        assert_eq!(top, 1080 - 520 - 8);
+        assert_eq!((left, top), (1552, 552));
+
+        let secondary = RECT {
+            left: -1920,
+            top: -200,
+            right: 0,
+            bottom: 880,
+        };
+        assert_eq!(
+            calculate_flyout_position(secondary, 360, 520, 8),
+            (-368, 352)
+        );
 
         // Test clamping (e.g. if width/height is larger than screen size)
         let (left_clamp, top_clamp) = calculate_flyout_position(screen, 2000, 1200, 8);

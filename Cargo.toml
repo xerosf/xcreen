@@ -36,11 +36,13 @@ serde_json = "1"
 
 # Logging
 log = { version = "0.4", features = ["std"] }
+tracing = { version = "0.1", default-features = false, features = ["std", "log-always"] }
 
 # Windows APIs for DDC/CI and light sensor
 windows = { version = "0.56.0", features = [
     "Devices_Sensors",
     "Foundation", 
+    "Win32_Devices_Display",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dwm",
     "Win32_System_LibraryLoader",
@@ -62,3 +64,20 @@ notify = "6.1"
 [build-dependencies]
 winres = "0.1"
 windows-reactor-setup = { git = "https://github.com/microsoft/windows-rs", rev = "2ad09303" }
+
+[lints.rust]
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+unwrap_used = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+wildcard_imports = "warn"
+redundant_clone = "warn"
+cloned_instead_of_copied = "warn"
+needless_borrow = "warn"
+manual_let_else = "warn"
+match_same_arms = "warn"
+doc_markdown = "warn"
+undocumented_unsafe_blocks = "warn"

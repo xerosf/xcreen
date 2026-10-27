@@ -1,21 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MonitorConfig {
-    pub id: String,
-    pub display_device: String,
-    pub physical_index: u32,
-    pub name: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppConfig {
     pub autostart_enabled: bool,
-    pub last_brightness: u32,
-    #[serde(default)]
-    pub monitors: Vec<MonitorConfig>,
     pub log_level: String,
 }
 
@@ -23,8 +12,6 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             autostart_enabled: false,
-            last_brightness: 50,
-            monitors: Vec::new(),
             log_level: "warn".to_string(),
         }
     }
@@ -48,6 +35,11 @@ impl AppConfig {
             return Ok(default_config);
         }
 
+        Self::load_existing()
+    }
+
+    pub fn load_existing() -> Result<Self, String> {
+        let config_path = Self::get_config_path()?;
         let content = fs::read_to_string(&config_path).map_err(|e| {
             format!(
                 "Failed to read config file '{}': {e}",
@@ -65,28 +57,27 @@ impl AppConfig {
     }
 
     pub fn from_json(content: &str) -> Result<Self, serde_json::Error> {
-        // Serde ignores legacy `brightness_profiles` fields, allowing existing
-        // configurations to migrate without keeping profiles in the app model.
+        // Legacy profiles and monitor inventory are ignored.
         serde_json::from_str(content)
     }
 
     pub fn save(&self) -> Result<(), String> {
+        self.save_to(&Self::get_config_path()?)
+    }
+
+    fn save_to(&self, config_path: &Path) -> Result<(), String> {
         self.validate()?;
-        let config_path = Self::get_config_path()?;
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize config: {e}"))?;
-        fs::write(&config_path, json).map_err(|e| format!("Failed to write config file: {e}"))
+        let temporary = config_path.with_extension(format!("json.{}.tmp", std::process::id()));
+        let result = fs::write(&temporary, json).and_then(|()| fs::rename(&temporary, config_path));
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result.map_err(|e| format!("Failed to write config file: {e}"))
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        for monitor in &self.monitors {
-            if monitor.id.trim().is_empty() {
-                return Err("Monitor id cannot be empty".to_string());
-            }
-        }
-        if self.last_brightness > 100 {
-            return Err("Last brightness cannot exceed 100%".to_string());
-        }
         if !matches!(self.log_level.as_str(), "error" | "warn" | "info" | "debug") {
             return Err(format!(
                 "Invalid log level: '{}'. Must be one of: error, warn, info, debug",
@@ -95,34 +86,37 @@ impl AppConfig {
         }
         Ok(())
     }
-
-    pub fn merge_connected_monitors(
-        &mut self,
-        monitors: &[crate::modules::monitor::MonitorInfo],
-    ) -> bool {
-        let original_len = self.monitors.len();
-        for monitor in monitors {
-            if self
-                .monitors
-                .iter()
-                .any(|configured| configured.id == monitor.id)
-            {
-                continue;
-            }
-            self.monitors.push(MonitorConfig {
-                id: monitor.id.clone(),
-                display_device: monitor.display_device.clone(),
-                physical_index: monitor.physical_index,
-                name: monitor.name.clone(),
-            });
-        }
-        self.monitors.len() != original_len
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saving_replaces_existing_config_and_invalid_settings_leave_it_intact() {
+        let directory = std::env::temp_dir().join(format!("xcreen-config-{}", std::process::id()));
+        fs::create_dir(&directory).expect("create isolated config fixture");
+        let path = directory.join("config.json");
+        let mut config = AppConfig::default();
+        config.save_to(&path).expect("save defaults");
+        config.autostart_enabled = true;
+        config.save_to(&path).expect("replace existing file");
+        let saved = fs::read_to_string(&path).expect("read replaced config");
+        assert!(
+            AppConfig::from_json(&saved)
+                .expect("valid saved JSON")
+                .autostart_enabled
+        );
+        config.log_level = "invalid".into();
+        assert!(config.save_to(&path).is_err());
+        assert_eq!(
+            fs::read_to_string(&path).expect("read unchanged config"),
+            saved
+        );
+        assert_eq!(fs::read_dir(&directory).expect("list fixture").count(), 1);
+        fs::remove_file(path).expect("remove fixture file");
+        fs::remove_dir(directory).expect("remove fixture directory");
+    }
 
     #[test]
     fn parses_legacy_config_and_ignores_profiles() {
@@ -136,21 +130,17 @@ mod tests {
                 "log_level": "debug"
             }"#,
         )
-        .unwrap();
+        .expect("legacy configuration must deserialize");
         assert!(config.autostart_enabled);
-        assert_eq!(config.last_brightness, 42);
-        assert!(config.monitors.is_empty());
+        assert_eq!(config.log_level, "debug");
     }
 
     #[test]
-    fn validates_monitor_ids() {
-        let mut config = AppConfig::default();
-        config.monitors.push(MonitorConfig {
-            id: String::new(),
-            display_device: "DISPLAY1".into(),
-            physical_index: 0,
-            name: "Monitor".into(),
-        });
+    fn rejects_invalid_log_levels() {
+        let config = AppConfig {
+            log_level: "trace".into(),
+            ..AppConfig::default()
+        };
         assert!(config.validate().is_err());
     }
 }

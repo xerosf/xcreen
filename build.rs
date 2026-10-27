@@ -8,7 +8,7 @@ fn main() {
         // Set icon if present (expects .ico file)
         let ico_path = std::path::Path::new("src/icons/icon.ico");
         if ico_path.exists() {
-            res.set_icon(ico_path.to_str().unwrap());
+            res.set_icon("src/icons/icon.ico");
         } else {
             println!(
                 "cargo:warning=Windows .ico not found at {} - skipping icon embedding",
