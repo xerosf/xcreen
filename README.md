@@ -63,9 +63,22 @@ any JavaScript dependencies:
 ```powershell
 bun fmt
 bun verify
-cargo build --release
+cargo build --locked --release
 ```
 
 Verification covers formatting, Clippy, and regression tests. Hardware checks should
 also cover startup with sleeping monitors, hot-plugging, resume, brightness-only
 monitors, and flyout placement on displays with different DPI and negative coordinates.
+
+The Reactor runtime and setup crates share a pinned revision supporting the
+`ReactorHost` and hook APIs. The newer upstream preview uses a different component API;
+upgrading past this pin requires migrating the UI. Update both pins together.
+
+## Releases
+
+Pull requests and pushes to `main` run formatting, Clippy, and tests on Windows.
+To publish a release, bump the version in `Cargo.toml`, update `Cargo.lock`, and push
+to `main`. The workflow builds the installer and publishes a new versioned release
+after verification passes. It can also be started manually through GitHub Actions.
+Existing version tags and their release assets are preserved; publishing another
+installer requires a new version.

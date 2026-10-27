@@ -2,76 +2,111 @@ name: release
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
+  verify:
+    name: Verify (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      - name: Verify formatting, lints, and tests
+        run: bun verify
+
   build-and-release:
     name: Build and Release (Windows)
+    needs: verify
+    if: github.event_name != 'pull_request'
     runs-on: windows-latest
+    permissions:
+      contents: write
     env:
       CARGO_TERM_COLOR: always
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: stable
-          targets: x86_64-pc-windows-msvc
-
-      # Magic step: Caches the cargo registry, git repos, and target directory
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build (release, x86_64-pc-windows-msvc)
-        shell: pwsh
-        run: |
-          cargo build --release --target x86_64-pc-windows-msvc
-
-      - name: Extract version from Cargo.toml
+      - name: Check release version
         id: version
         shell: pwsh
         run: |
-          $toml = Get-Content Cargo.toml -Raw
-          if ($toml -match '(?m)^\s*version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"') {
-            $version = $Matches[1]
-          } else {
-            Write-Error "Version not found in Cargo.toml"
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = ($metadata.packages | Where-Object name -eq 'XCreen').version
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "Invalid release version: $version" }
+          $tag = "v$version"
+          git ls-remote --exit-code --tags origin "refs/tags/$tag"
+          $tagStatus = $LASTEXITCODE
+          if ($tagStatus -notin 0, 2) { throw "Failed to check release tag $tag" }
+          $publish = $tagStatus -eq 2
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "publish=$($publish.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          if (-not $publish) {
+            "Release $tag already exists. Bump Cargo.toml to publish a new release." >> $env:GITHUB_STEP_SUMMARY
           }
-          "version=$version" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append -Encoding utf8
-          "tag=v$version" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append -Encoding utf8
+          exit 0
 
-      # REMOVED: choco install innosetup (It is pre-installed on windows-latest)
+      - name: Install Rust
+        if: steps.version.outputs.publish == 'true'
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: x86_64-pc-windows-msvc
 
-      - name: Build Installer
+      - name: Rust cache
+        if: steps.version.outputs.publish == 'true'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Build release
+        if: steps.version.outputs.publish == 'true'
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc
+
+      - name: Build installer
+        if: steps.version.outputs.publish == 'true'
         shell: pwsh
         run: |
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DMyAppVersion="${{ steps.version.outputs.version }}" installer.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Upload artifact (CI)
-        uses: actions/upload-artifact@v4
+      - name: Upload installer
+        if: steps.version.outputs.publish == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: XCreen-Setup-${{ steps.version.outputs.version }}
           path: XCreen-Setup-${{ steps.version.outputs.version }}.exe
           if-no-files-found: error
 
-      - name: Create GitHub Release
-        uses: ncipollo/release-action@v1.14.0
+      - name: Publish release
+        if: steps.version.outputs.publish == 'true'
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1.21.0
         with:
           tag: ${{ steps.version.outputs.tag }}
+          commit: ${{ github.sha }}
           name: XCreen ${{ steps.version.outputs.tag }}
           artifacts: XCreen-Setup-${{ steps.version.outputs.version }}.exe
+          artifactErrorsFailBuild: true
           generateReleaseNotes: true
-          allowUpdates: true
-          replacesArtifacts: true
           makeLatest: true
-          token: ${{ secrets.GITHUB_TOKEN }}

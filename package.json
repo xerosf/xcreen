@@ -3,6 +3,6 @@
   "private": true,
   "scripts": {
     "fmt": "cargo fmt",
-    "verify": "cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test"
+    "verify": "cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked"
   }
 }

@@ -7,7 +7,7 @@ use modules::config::AppConfig;
 use modules::monitor::{LevelKind, MonitorInfo, MonitorLevels};
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -16,7 +16,7 @@ use tray_icon::{
     Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
     menu::{Menu, MenuItem, PredefinedMenuItem},
 };
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWINDOWATTRIBUTE, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
@@ -33,11 +33,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_CANCELMODE, WM_DISPLAYCHANGE, WM_POWERBROADCAST, WM_TIMER, WS_CAPTION, WS_EX_APPWINDOW,
     WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
 };
+use windows::core::BOOL;
 use windows_reactor::{
-    App, AsyncSetState, Backdrop, ComboBox, Component, Element, ElementExt, GridLength,
-    HorizontalAlignment, InfoBar, InfoBarSeverity, InnerConstraints, ProgressRing, ReactorHost,
-    RenderCx, Slider, Thickness, ToggleSwitch, VerticalAlignment, WindowSize, body, body_strong,
-    border, button, caption, grid, hstack, subtitle, vstack,
+    AccessibilityExt, App, AsyncSetState, Backdrop, ComboBox, Component, Element, GridChildExt,
+    GridLength, HorizontalAlignment, InfoBar, InfoBarSeverity, InnerConstraints, LayoutExt,
+    PaddingExt, ProgressRing, ReactorHost, RenderCx, Slider, TextStyleExt, Thickness, ToggleSwitch,
+    TooltipExt, VerticalAlignment, VisualExt, WindowSize, body, body_strong, border, button,
+    caption, grid, hstack, subtitle, vstack,
 };
 use winreg::RegKey;
 use winreg::enums::{HKEY_CURRENT_USER, KEY_SET_VALUE};
@@ -115,7 +117,7 @@ impl UiSnapshot {
 static UI_SNAPSHOT: OnceLock<Mutex<UiSnapshot>> = OnceLock::new();
 static UI_SETTER: OnceLock<AsyncSetState<UiSnapshot>> = OnceLock::new();
 static CONFIG: OnceLock<Mutex<AppConfig>> = OnceLock::new();
-static FLYOUT_HWND: AtomicIsize = AtomicIsize::new(0);
+static FLYOUT_HWND: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 static SHOWN_AT: Mutex<Option<Instant>> = Mutex::new(None);
 
 thread_local! {
@@ -676,7 +678,7 @@ fn app(cx: &mut RenderCx) -> Element {
         vstack((header, controls)).spacing(12.0).into()
     };
 
-    let settings_content: Element = {
+    let settings_content = {
         let header = grid((hstack((
             button("\u{E76B}")
                 .font_family("Segoe Fluent Icons")
@@ -743,7 +745,7 @@ fn app(cx: &mut RenderCx) -> Element {
         ))
         .spacing(12.0);
 
-        vstack((header, controls)).spacing(12.0).into()
+        vstack((header, controls)).spacing(12.0)
     };
 
     let ambient_id = snapshot
@@ -821,15 +823,14 @@ fn app(cx: &mut RenderCx) -> Element {
         })
         .unwrap_or_else(|| vstack(()).into());
 
-    let main_content: Element = grid((
+    let main_content = grid((
         vstack((main_inner, error_element))
             .spacing(16.0)
             .grid_row(0),
         footer.grid_row(1),
     ))
     .rows(vec![GridLength::STAR, GridLength::Auto])
-    .row_spacing(16.0)
-    .into();
+    .row_spacing(16.0);
 
     let gap = 40.0;
     let content_width = 360.0 - 32.0; // 328.0
@@ -951,7 +952,7 @@ fn current_thread_window() -> Option<HWND> {
             LPARAM(&mut hwnd as *mut HWND as isize),
         );
     }
-    (hwnd.0 != 0).then_some(hwnd)
+    (!hwnd.0.is_null()).then_some(hwnd)
 }
 
 fn configure_flyout_window(hwnd: HWND) {
@@ -969,7 +970,7 @@ fn configure_flyout_window(hwnd: HWND) {
         );
         let _ = SetWindowPos(
             hwnd,
-            HWND::default(),
+            None,
             0,
             0,
             0,
@@ -1035,7 +1036,7 @@ fn position_flyout(hwnd: HWND, anchor_x: i32, anchor_y: i32) {
         // Resize the window first to let OS apply constraints
         let _ = SetWindowPos(
             hwnd,
-            HWND_TOPMOST,
+            Some(HWND_TOPMOST),
             0,
             0,
             width,
@@ -1055,7 +1056,7 @@ fn position_flyout(hwnd: HWND, anchor_x: i32, anchor_y: i32) {
         let (x, y) = calculate_flyout_position(screen, actual_width, actual_height, gap);
         let _ = SetWindowPos(
             hwnd,
-            HWND_TOPMOST,
+            Some(HWND_TOPMOST),
             x,
             y,
             actual_width,
@@ -1077,11 +1078,11 @@ fn dismiss_tray_menu() {
     // SAFETY: The PID output is live, and the posted message has no pointer payload.
     unsafe {
         let fg = GetForegroundWindow();
-        if fg.0 != 0 {
+        if !fg.0.is_null() {
             let mut pid = 0;
             let _ = GetWindowThreadProcessId(fg, Some(&mut pid));
             if pid == std::process::id() {
-                let _ = PostMessageW(fg, WM_CANCELMODE, None, None);
+                let _ = PostMessageW(Some(fg), WM_CANCELMODE, WPARAM(0), LPARAM(0));
             }
         }
     }
@@ -1089,7 +1090,7 @@ fn dismiss_tray_menu() {
 
 fn window_belongs_to_flyout(flyout: HWND, candidate: HWND) -> bool {
     // SAFETY: GetAncestor accepts window handles and returns null for invalid ones.
-    candidate.0 != 0
+    !candidate.0.is_null()
         && (candidate == flyout || unsafe { GetAncestor(candidate, GA_ROOTOWNER) == flyout })
 }
 
@@ -1110,7 +1111,7 @@ unsafe extern "system" fn flyout_subclass(
             // SAFETY: Window visibility and timer changes run on the owning UI thread.
             unsafe {
                 let _ = ShowWindow(hwnd, SW_SHOW);
-                SetTimer(hwnd, DISMISS_TIMER, 75, None);
+                SetTimer(Some(hwnd), DISMISS_TIMER, 75, None);
             }
             // SAFETY: hwnd is this window on its owning message thread.
             unsafe {
@@ -1122,7 +1123,7 @@ unsafe extern "system" fn flyout_subclass(
             // SAFETY: This window and timer belong to the current UI thread.
             unsafe {
                 let _ = ShowWindow(hwnd, SW_HIDE);
-                let _ = KillTimer(hwnd, DISMISS_TIMER);
+                let _ = KillTimer(Some(hwnd), DISMISS_TIMER);
             }
             LRESULT(0)
         }
@@ -1135,7 +1136,7 @@ unsafe extern "system" fn flyout_subclass(
                     || (!shown_recently && !window_belongs_to_flyout(hwnd, GetForegroundWindow()))
                 {
                     let _ = ShowWindow(hwnd, SW_HIDE);
-                    let _ = KillTimer(hwnd, DISMISS_TIMER);
+                    let _ = KillTimer(Some(hwnd), DISMISS_TIMER);
                 }
             }
             LRESULT(0)
@@ -1143,7 +1144,7 @@ unsafe extern "system" fn flyout_subclass(
         WM_TIMER if wparam.0 == DISCOVERY_TIMER => {
             // SAFETY: The timer belongs to this subclassed window and is no longer needed.
             unsafe {
-                let _ = KillTimer(hwnd, DISCOVERY_TIMER);
+                let _ = KillTimer(Some(hwnd), DISCOVERY_TIMER);
             }
             refresh_monitors_async(false);
             LRESULT(0)
@@ -1151,7 +1152,7 @@ unsafe extern "system" fn flyout_subclass(
         WM_DISPLAYCHANGE => {
             // SAFETY: Setting the same window timer replaces its previous deadline.
             unsafe {
-                SetTimer(hwnd, DISCOVERY_TIMER, 300, None);
+                SetTimer(Some(hwnd), DISCOVERY_TIMER, 300, None);
             }
             // SAFETY: Forward this unmodified window message to the previous procedure.
             unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
@@ -1159,7 +1160,7 @@ unsafe extern "system" fn flyout_subclass(
         WM_POWERBROADCAST if wparam.0 == PBT_APMRESUMEAUTOMATIC => {
             // SAFETY: This timer is attached to the current window's message thread.
             unsafe {
-                SetTimer(hwnd, DISCOVERY_TIMER, 1000, None);
+                SetTimer(Some(hwnd), DISCOVERY_TIMER, 1000, None);
             }
             LRESULT(1)
         }
@@ -1170,14 +1171,14 @@ unsafe extern "system" fn flyout_subclass(
 
 fn request_show_flyout(anchor_x: i32, anchor_y: i32) {
     let hwnd = HWND(FLYOUT_HWND.load(Ordering::SeqCst));
-    if hwnd.0 == 0 {
+    if hwnd.0.is_null() {
         return;
     }
     dismiss_tray_menu();
     // SAFETY: The posted coordinates are integers; no borrowed pointers cross threads.
     unsafe {
         let _ = PostMessageW(
-            hwnd,
+            Some(hwnd),
             WM_SHOW_FLYOUT,
             WPARAM(anchor_x as isize as usize),
             LPARAM(anchor_y as isize),
@@ -1192,18 +1193,18 @@ fn request_show_flyout(anchor_x: i32, anchor_y: i32) {
 
 fn request_hide_flyout() {
     let hwnd = HWND(FLYOUT_HWND.load(Ordering::SeqCst));
-    if hwnd.0 == 0 {
+    if hwnd.0.is_null() {
         return;
     }
     // SAFETY: This message carries no pointers and runs visibility changes on the UI thread.
     unsafe {
-        let _ = PostMessageW(hwnd, WM_HIDE_FLYOUT, None, None);
+        let _ = PostMessageW(Some(hwnd), WM_HIDE_FLYOUT, WPARAM(0), LPARAM(0));
     }
 }
 
 fn toggle_flyout(anchor_x: i32, anchor_y: i32) {
     let hwnd = HWND(FLYOUT_HWND.load(Ordering::SeqCst));
-    if hwnd.0 == 0 {
+    if hwnd.0.is_null() {
         return;
     }
     // SAFETY: IsWindowVisible accepts a window handle and has no output pointers.
@@ -1392,7 +1393,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         unsafe {
             let _ = SetWindowPos(
                 hwnd,
-                HWND_TOPMOST,
+                Some(HWND_TOPMOST),
                 -10000,
                 -10000,
                 width,

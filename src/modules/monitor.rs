@@ -10,13 +10,14 @@ use windows::Win32::{
         GetPhysicalMonitorsFromHMONITOR, PHYSICAL_MONITOR, QDC_ONLY_ACTIVE_PATHS,
         QueryDisplayConfig, SetMonitorBrightness, SetMonitorContrast,
     },
-    Foundation::{BOOL, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE, LPARAM, RECT},
+    Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE, LPARAM, RECT},
     Graphics::Gdi::{
         DISPLAYCONFIG_PATH_ACTIVE, EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR,
         MONITORINFOEXW,
     },
     UI::WindowsAndMessaging::MONITORINFOF_PRIMARY,
 };
+use windows::core::BOOL;
 
 struct PhysicalMonitorList(Vec<PHYSICAL_MONITOR>);
 
@@ -35,10 +36,10 @@ fn open_physical_monitors(monitor_handle: isize) -> Result<PhysicalMonitorList, 
     // initialized array remain valid for the synchronous API calls.
     unsafe {
         let mut count = 0;
-        GetNumberOfPhysicalMonitorsFromHMONITOR(HMONITOR(monitor_handle), &mut count)
+        GetNumberOfPhysicalMonitorsFromHMONITOR(HMONITOR(monitor_handle as _), &mut count)
             .map_err(|err| format!("Physical monitor count failed: {err}"))?;
         let mut monitors = vec![PHYSICAL_MONITOR::default(); count as usize];
-        GetPhysicalMonitorsFromHMONITOR(HMONITOR(monitor_handle), &mut monitors)
+        GetPhysicalMonitorsFromHMONITOR(HMONITOR(monitor_handle as _), &mut monitors)
             .map_err(|err| format!("Physical monitor enumeration failed: {err}"))?;
         Ok(PhysicalMonitorList(monitors))
     }
@@ -169,8 +170,9 @@ fn validate_display(monitor: &MonitorInfo) -> Result<(), String> {
     info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
     // SAFETY: info has the API-required size and a live writable buffer. Windows
     // rejects an HMONITOR that became invalid after a display configuration change.
-    if unsafe { GetMonitorInfoW(HMONITOR(monitor.display_handle), &mut info.monitorInfo).as_bool() }
-        && wide_to_string(&info.szDevice).eq_ignore_ascii_case(&monitor.display_device)
+    if unsafe {
+        GetMonitorInfoW(HMONITOR(monitor.display_handle as _), &mut info.monitorInfo).as_bool()
+    } && wide_to_string(&info.szDevice).eq_ignore_ascii_case(&monitor.display_device)
     {
         Ok(())
     } else {
@@ -324,7 +326,7 @@ fn enumerate_gdi_displays() -> Result<Vec<GdiDisplay>, String> {
         if unsafe { GetMonitorInfoW(hmonitor, &mut info.monitorInfo as *mut _ as *mut _).as_bool() }
         {
             displays.push(GdiDisplay {
-                handle: hmonitor.0,
+                handle: hmonitor.0 as isize,
                 device: wide_to_string(&info.szDevice),
                 is_primary: (info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY) != 0,
             });
@@ -335,7 +337,7 @@ fn enumerate_gdi_displays() -> Result<Vec<GdiDisplay>, String> {
     // SAFETY: displays lives until synchronous enumeration completes.
     unsafe {
         EnumDisplayMonitors(
-            HDC::default(),
+            None,
             None,
             Some(enum_monitor_proc),
             LPARAM(&mut displays as *mut _ as isize),
@@ -585,16 +587,16 @@ mod tests {
         };
         let physical = [
             PHYSICAL_MONITOR {
-                hPhysicalMonitor: HANDLE(1),
+                hPhysicalMonitor: HANDLE(1usize as _),
                 ..Default::default()
             },
             PHYSICAL_MONITOR {
-                hPhysicalMonitor: HANDLE(2),
+                hPhysicalMonitor: HANDLE(2usize as _),
                 ..Default::default()
             },
         ];
         let monitors = describe_physical_monitors(&display, None, &physical, |handle| {
-            if handle == HANDLE(1) {
+            if handle == HANDLE(1usize as _) {
                 Err("Display is waking".into())
             } else {
                 Ok(MonitorLevels {
